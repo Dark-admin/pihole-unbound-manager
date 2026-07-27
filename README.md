@@ -33,7 +33,6 @@ Pensado originalmente para Raspberry Pi (incluye ajustes de memoria para equipos
 | `install.sh` | Instala Pi-hole (modo unattended) + Unbound, aplica el fix de puerto 53, descarga los root hints, conecta Pi-hole → Unbound, aplica tuning de memoria y carga listas de bloqueo. |
 | `manage.sh` | Panel de gestión en terminal (TUI): estado de servicios, test de resolución DNS, verificación de instalación, reinicio de servicios, gestión del firewall (puerto 53) y listado de blocklists activas. |
 | `dashboard.py` | Dashboard web con estado en vivo, verificación, listas y botón de reinicio. Soporta autenticación básica. |
-| `push-to-github.sh` | Sube el proyecto a un repositorio de GitHub. |
 
 ---
 
@@ -83,14 +82,6 @@ sudo python3 dashboard.py --port 8080 --auth usuario:password
 | `--host` | IP de escucha | `127.0.0.1` |
 | `--port` | Puerto | `8080` |
 | `--auth` | Autenticación básica (usuario:password) | desactivada |
-
----
-
-## 📤 Subir a GitHub
-
-```bash
-./push-to-github.sh <tu-usuario> [nombre-repo] [token]
-```
 
 ---
 
