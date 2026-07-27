@@ -121,11 +121,22 @@ info "Conectando Pi-hole a Unbound (127.0.0.1#5335)..."
 # Configurar upstream DNS en pihole.toml
 PIHOLE_TOML="/etc/pihole/pihole.toml"
 if [[ -f "$PIHOLE_TOML" ]]; then
-  # Buscar upstreams existente y reemplazar
+  # Reemplazar upstreams existente o agregar al final
   if grep -q 'upstreams' "$PIHOLE_TOML" 2>/dev/null; then
-    $SUDO sed -i '/upstreams = \[/,/\]/c\  upstreams = [\n    "127.0.0.1#5335"\n  ]' "$PIHOLE_TOML"
+    $SUDO python3 -c "
+import re
+with open('$PIHOLE_TOML', 'r') as f:
+    content = f.read()
+content = re.sub(r'upstreams\s*=\s*\[.*?\]', 'upstreams = [\"127.0.0.1#5335\"]', content, flags=re.DOTALL)
+with open('$PIHOLE_TOML', 'w') as f:
+    f.write(content)
+" 2>/dev/null || {
+    # Fallback: borrar lineas de upstreams y agregar
+    $SUDO sed -i '/upstreams/d' "$PIHOLE_TOML"
+    echo '' | $SUDO tee -a "$PIHOLE_TOML" >/dev/null
+    echo 'upstreams = ["127.0.0.1#5335"]' | $SUDO tee -a "$PIHOLE_TOML" >/dev/null
+  }
   else
-    # Agregar al final si no existe
     echo 'upstreams = ["127.0.0.1#5335"]' | $SUDO tee -a "$PIHOLE_TOML" >/dev/null
   fi
   $SUDO sed -i 's/listeningMode = "LOCAL"/listeningMode = "ALL"/' "$PIHOLE_TOML"
