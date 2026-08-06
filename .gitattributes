@@ -1,0 +1,7 @@
+# Finales de línea LF siempre. Un .sh con CRLF falla en Linux con
+# "bad interpreter: /bin/bash^M", y clonar desde Windows los introduce solo.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.svg text eol=lf

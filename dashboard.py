@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-dashboard.py - Dashboard web profesional para Pi-hole + Unbound
+dashboard.py - Panel web para Pi-hole + Unbound
 Autor: nexo (Dark)
-v2.0 - Mejorado: auth basica, port detection con regex, validaciones, try/except
+v3.0 - Alineado con nexo-dns.sh: lee el puerto real de Unbound y verifica
+       cosas que significan algo (antes comprobaba un "fix" que ya no existe).
 
 Uso:
     sudo python3 dashboard.py [--port 8080] [--host 0.0.0.0] [--auth usuario:password]
@@ -10,7 +11,6 @@ Uso:
 import http.server
 import socketserver
 import subprocess
-import json
 import re
 import os
 import sys
@@ -20,6 +20,9 @@ from datetime import datetime
 
 # --- Utilidades de sistema ---
 SUDO = "" if os.geteuid() == 0 else "sudo "
+
+NEXO_CONF = "/etc/nexo-dns.conf"
+UNBOUND_CONF = "/etc/unbound/unbound.conf.d/pi-hole.conf"
 
 def run(cmd):
     try:
@@ -31,9 +34,37 @@ def run(cmd):
 def service_active(name):
     return run("{}systemctl is-active {}".format(SUDO, name)).strip() == "active"
 
+def unbound_port():
+    """Puerto de Unbound. Lo escribe nexo-dns.sh; si no esta, se lee de la
+    propia config, y como ultimo recurso 5335."""
+    try:
+        with open(NEXO_CONF) as f:
+            for line in f:
+                if line.startswith("UNBOUND_PORT="):
+                    p = line.split("=", 1)[1].strip()
+                    if p.isdigit():
+                        return p
+    except Exception:
+        pass
+    m = re.search(r'^\s*port:\s*(\d+)', run("cat {} 2>/dev/null".format(UNBOUND_CONF)), re.M)
+    return m.group(1) if m else "5335"
+
+def pihole_port():
+    try:
+        with open(NEXO_CONF) as f:
+            for line in f:
+                if line.startswith("PIHOLE_PORT="):
+                    p = line.split("=", 1)[1].strip()
+                    if p.isdigit():
+                        return p
+    except Exception:
+        pass
+    return "53"
+
 def dig_test(server, port=""):
     p = "-p {}".format(port) if port else ""
     out = run("dig +short +time=2 google.com @{} {} 2>/dev/null | head -1".format(server, p))
+    # dig +short escribe ";; communications error" por stdout, no por stderr
     if out and not out.startswith(";;") and "." in out:
         return out
     return ""
@@ -53,23 +84,54 @@ def list_adlists():
         return []
 
 def port_open(port):
-    """Verifica si un puerto esta escuchando usando regex exacto."""
+    """Verifica si un puerto esta escuchando."""
     try:
         output = run("{}ss -tlnp 2>/dev/null".format(SUDO))
-        return re.search(r':{}\s'.format(port), output) is not None
+        return re.search(r':{}\s'.format(re.escape(str(port))), output) is not None
     except Exception:
         return False
 
+def clients_24h():
+    """Cuantos clientes usan de verdad este DNS. Si son muy pocos, casi seguro
+    el router sigue repartiendo su propio DNS y esto esta de adorno."""
+    sql = ("SELECT COUNT(DISTINCT client) FROM query_storage "
+           "WHERE timestamp > strftime('%s','now','-1 day');")
+    n = run('{}pihole-FTL sqlite3 /etc/pihole/pihole-FTL.db "{}"'.format(SUDO, sql)).strip()
+    return n if n.isdigit() else "?"
+
 def verify():
-    root_hints_ok = os.path.isfile("/usr/share/dns/root.hints") and os.path.getsize("/usr/share/dns/root.hints") > 0
-    checks = {
-        "Puerto 53 (Pi-hole)": port_open("53"),
-        "Puerto 5335 (Unbound)": port_open("5335"),
-        "Fix Unbound (interface comentado)": "#interface:" in run("grep ^#interface: /etc/unbound/unbound.conf 2>/dev/null"),
-        "Upstream = Unbound": "127.0.0.1#5335" in run("grep upstreams /etc/pihole/pihole.toml 2>/dev/null"),
-        "Root hints": root_hints_ok,
+    uport = unbound_port()
+    pport = pihole_port()
+    # root.hints puede venir del paquete dns-root-data o descargarse aparte
+    hints_ok = any(
+        os.path.isfile(p) and os.path.getsize(p) > 0
+        for p in ("/usr/share/dns/root.hints",
+                  "/var/lib/unbound/root.hints",
+                  "/etc/unbound/root.hints")
+    )
+    # Prueba real de DNSSEC: una firma rota TIENE que ser rechazada
+    servfail = "SERVFAIL" in run(
+        "dig dnssec-failed.org @127.0.0.1 -p {} +time=3 2>/dev/null".format(uport))
+    # Unbound debe escuchar solo en localhost, no ser un recursivo abierto
+    localhost_only = "127.0.0.1" in run(
+        "grep -E '^[[:space:]]*interface:' {} 2>/dev/null".format(UNBOUND_CONF))
+
+    # En pihole.toml v6 el valor va en la linea SIGUIENTE a "upstreams = [",
+    # asi que un grep simple nunca lo encuentra. Se usa la API de Pi-hole, y
+    # solo se cae al fichero (con -A3) si no hay CLI v6.
+    upstream_raw = run("{}pihole-FTL --config dns.upstreams 2>/dev/null".format(SUDO))
+    if not upstream_raw:
+        upstream_raw = run("{}grep -A3 upstreams /etc/pihole/pihole.toml 2>/dev/null".format(SUDO))
+    upstream_ok = "127.0.0.1#{}".format(uport) in upstream_raw
+
+    return {
+        "Puerto {} (Pi-hole)".format(pport): port_open(pport),
+        "Puerto {} (Unbound)".format(uport): port_open(uport),
+        "Unbound solo en localhost": localhost_only,
+        "Upstream = Unbound": upstream_ok,
+        "DNSSEC rechaza firmas rotas": servfail,
+        "Root hints": hints_ok,
     }
-    return checks
 
 def restart():
     run("{}systemctl restart unbound".format(SUDO))
@@ -81,9 +143,10 @@ def collect():
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "pihole": service_active("pihole-FTL"),
         "unbound": service_active("unbound"),
-        "dns_pihole": dig_test("127.0.0.1"),
-        "dns_unbound": dig_test("127.0.0.1", "5335"),
+        "dns_pihole": dig_test("127.0.0.1", pihole_port()),
+        "dns_unbound": dig_test("127.0.0.1", unbound_port()),
         "gravity": count_gravity(),
+        "clients": clients_24h(),
         "adlists": list_adlists(),
         "verify": verify(),
     }
@@ -118,6 +181,7 @@ section h2{font-size:1.1rem;margin-bottom:1rem;color:var(--accent)}
 .list-item:last-child{border-bottom:none}
 .btn{display:inline-block;background:var(--orange);color:#000;padding:.6rem 1.2rem;border-radius:8px;font-weight:600;border:none;cursor:pointer;text-decoration:none}
 .btn:hover{opacity:.85}
+.hint{font-size:.85rem;color:var(--muted);margin-top:.6rem;line-height:1.5}
 footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:2rem}
 """
 
@@ -135,39 +199,51 @@ def render_html(data):
     pihole_status = "Activo" if data["pihole"] else "Caido"
     unbound_status = "Activo" if data["unbound"] else "Caido"
 
+    # Pocos clientes casi siempre significa que el router no reparte esta IP
+    try:
+        few = int(data["clients"]) <= 2
+    except (ValueError, TypeError):
+        few = False
+    clients_dot = "warn" if few else "ok"
+    hint = ('<div class="hint">Muy pocos clientes para una red domestica. '
+            'Revisa el DHCP de tu router: debe repartir la IP de esta maquina '
+            'como UNICO servidor DNS. Un secundario publico salta el filtrado.</div>') if few else ""
+
     html = (
         '<!DOCTYPE html>'
         '<html lang="es"><head><meta charset="UTF-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<title>Pi-hole + Unbound Dashboard</title>'
+        '<title>nexo-dns</title>'
         '<link rel="icon" href="/logo.svg">'
         '<style>{}</style>'
         '<meta http-equiv="refresh" content="15"></head>'
         '<body><div class="wrap">'
         '<div class="logo-box">'
-        '  <img src="/logo.svg" alt="Pi-hole Unbound logo">'
-        '  <div class="tag">DNS privado y rapido</div>'
+        '  <img src="/logo.svg" alt="nexo-dns logo">'
+        '  <div class="tag">DNS privado, filtrado y recursivo</div>'
         '</div>'
-        '<header><h1>Pi-hole + Unbound</h1><span class="badge">Actualizado: {}</span></header>'
+        '<header><h1>nexo-dns</h1><span class="badge">Actualizado: {}</span></header>'
         '<div class="grid">'
         '  <div class="card"><div class="label">Pi-hole FTL</div><div class="value"><span class="dot {}"></span>{}</div></div>'
         '  <div class="card"><div class="label">Unbound</div><div class="value"><span class="dot {}"></span>{}</div></div>'
         '  <div class="card"><div class="label">Dominios bloqueados</div><div class="value">{}</div></div>'
-        '  <div class="card"><div class="label">DNS (Pi-hole)</div><div class="value" style="font-size:1rem">{}</div></div>'
+        '  <div class="card"><div class="label">Clientes (24 h)</div><div class="value"><span class="dot {}"></span>{}</div></div>'
         '</div>'
-        '<section><h2>Verificacion de instalacion</h2>{}</section>'
+        '{}'
+        '<section><h2>Verificacion</h2>{}</section>'
         '<section><h2>Listas de bloqueo ({})</h2>{}</section>'
         '<section><h2>Acciones</h2>'
         '  <form method="post" action="/restart"><button class="btn" type="submit">Reiniciar servicios</button></form>'
         '</section>'
-        '<footer>Pi-hole + Unbound Manager by nexo (Dark)</footer>'
+        '<footer>nexo-dns by nexo (Dark)</footer>'
         '</div></body></html>'
     ).format(
         CSS, data["timestamp"],
         pihole_dot, pihole_status,
         unbound_dot, unbound_status,
         data["gravity"],
-        data["dns_pihole"] or "-",
+        clients_dot, data["clients"],
+        hint,
         checks,
         len(data["adlists"]),
         lists
@@ -193,11 +269,14 @@ def check_auth(headers):
 
 # --- Servidor HTTP ---
 class Handler(http.server.BaseHTTPRequestHandler):
+    def _deny(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="nexo-dns"')
+        self.end_headers()
+
     def do_GET(self):
         if not check_auth(self.headers):
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="Pi-hole Dashboard"')
-            self.end_headers()
+            self._deny()
             return
 
         if self.path == "/logo.svg":
@@ -214,6 +293,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
             return
         if self.path == "/restart":
+            # Reiniciar es una accion con efecto: solo por POST, nunca por GET.
             self.send_response(302)
             self.send_header("Location", "/")
             self.end_headers()
@@ -227,9 +307,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not check_auth(self.headers):
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="Pi-hole Dashboard"')
-            self.end_headers()
+            self._deny()
             return
         if self.path == "/restart":
             restart()
@@ -244,7 +322,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 def main():
-    ap = argparse.ArgumentParser(description="Pi-hole + Unbound Dashboard")
+    ap = argparse.ArgumentParser(description="nexo-dns - panel web")
     ap.add_argument("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
     ap.add_argument("--port", type=int, default=8080, help="Puerto (default: 8080)")
     ap.add_argument("--auth", help="Autenticacion basica: usuario:password")
@@ -256,13 +334,16 @@ def main():
             print("Error: --auth debe ser usuario:password")
             sys.exit(1)
         AUTH_USER, AUTH_PASS = args.auth.split(":", 1)
-        print("Autenticacion basica habilitada para usuario: {}".format(AUTH_USER))
+        print("Autenticacion basica habilitada para el usuario: {}".format(AUTH_USER))
+    elif args.host != "127.0.0.1":
+        print("AVISO: lo estas exponiendo a la red SIN autenticacion.")
+        print("       Usa --auth usuario:password")
 
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer((args.host, args.port), Handler) as httpd:
         print("Dashboard en http://{}:{}".format(args.host, args.port))
         if args.host == "0.0.0.0":
-            print("  Accede desde: http://<IP-de-la-Pi>:{}".format(args.port))
+            print("  Accede desde: http://<IP-del-servidor>:{}".format(args.port))
         print("Ctrl+C para detener")
         try:
             httpd.serve_forever()
