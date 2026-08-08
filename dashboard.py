@@ -16,6 +16,7 @@ import os
 import sys
 import argparse
 import base64
+import hmac
 from datetime import datetime
 
 # --- Utilidades de sistema ---
@@ -263,7 +264,15 @@ def check_auth(headers):
     try:
         decoded = base64.b64decode(auth[6:]).decode()
         user, _, pwd = decoded.partition(":")
-        return user == AUTH_USER and pwd == AUTH_PASS
+        # compare_digest y no ==: el operador normal corta en cuanto encuentra
+        # un byte distinto, y ese tiempo distinto se mide. Con --host 0.0.0.0
+        # el panel queda expuesto y la contrasena se puede sacar a base de
+        # cronometrar respuestas, caracter a caracter.
+        # Los dos compare_digest se evaluan siempre —sin cortocircuito— para no
+        # filtrar por tiempo si lo que falla es el usuario o la contrasena.
+        ok_user = hmac.compare_digest(user, AUTH_USER)
+        ok_pass = hmac.compare_digest(pwd, AUTH_PASS)
+        return ok_user & ok_pass
     except Exception:
         return False
 

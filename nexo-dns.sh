@@ -3,8 +3,8 @@
 #  nexo-dns.sh — Instalador y panel de DNS privado
 #  Pi-hole + Unbound + Tailscale
 #
-#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v3.2
-#  Compatible: Raspberry Pi OS · Debian 11+ · Ubuntu 20.04+
+#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.0
+#  Compatible: Raspberry Pi OS · Debian 11+ · Ubuntu 20.04+ · VPS
 #
 #  Uso:
 #     sudo bash nexo-dns.sh              → panel
@@ -12,8 +12,15 @@
 #     sudo bash nexo-dns.sh status       → estado
 #     sudo bash nexo-dns.sh health       → chequeo con pruebas reales
 #     sudo bash nexo-dns.sh optimize     → reaplica la optimización
+#     sudo bash nexo-dns.sh security     → qué hay expuesto a internet
+#     sudo bash nexo-dns.sh firewall     → cierra el DNS al mundo
+#     sudo bash nexo-dns.sh banner       → portada
 #
 #  Todo cambio hace copia previa y se revierte solo si la verificación falla.
+#
+#  Detecta si corre en una máquina doméstica o en una VPS pública y cambia
+#  en consecuencia los consejos y las comprobaciones de seguridad: en una VPS
+#  el riesgo no es quedarse sin internet, es dejar un resolver DNS abierto.
 #
 set -uo pipefail
 
@@ -26,7 +33,7 @@ fi
 
 # OJO: no llamarla VERSION. /etc/os-release define VERSION y al leerlo
 # machacaría la nuestra ("nexo-dns v13 (trixie)").
-NEXO_VERSION="3.2"
+NEXO_VERSION="4.0"
 CONF=/etc/nexo-dns.conf
 UNBOUND_CONF=/etc/unbound/unbound.conf.d/pi-hole.conf
 PIHOLE_TOML=/etc/pihole/pihole.toml
@@ -34,11 +41,70 @@ FTL_DB=/etc/pihole/pihole-FTL.db
 BACKUP_ROOT=/var/backups/nexo-dns
 
 # ══════════════════════════════════════════════════════════ presentación ═══════
-if [[ -t 1 ]]; then
-  RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YEL=$'\033[1;33m'; BLU=$'\033[0;34m'
-  CYN=$'\033[0;36m'; MAG=$'\033[0;35m'; DIM=$'\033[2m'; BLD=$'\033[1m'; NC=$'\033[0m'
+# Paleta de marca. Son los colores reales de cada proyecto, no aproximaciones:
+#   Pi-hole   #F60D1A rojo · #96060C granate  (logo y panel web de Pi-hole)
+#   Unbound   #3B82F6 azul · #22D3EE cian     (NLnet Labs)
+# Se usa la mayor profundidad de color que soporte el terminal y se degrada
+# hasta ANSI de 8 colores sin perder legibilidad. NO_COLOR=1 lo desactiva todo.
+COLOR_DEPTH=0
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  case "${COLORTERM:-}" in
+    truecolor|24bit) COLOR_DEPTH=24 ;;
+    *)
+      _nc=$(tput colors 2>/dev/null) || _nc=8
+      [[ "$_nc" =~ ^[0-9]+$ ]] || _nc=8
+      if   (( _nc >= 256 )); then COLOR_DEPTH=8
+      elif (( _nc >= 8   )); then COLOR_DEPTH=4
+      fi ;;
+  esac
+fi
+
+# fg R G B N256 ANSI → la secuencia que toque según lo que soporte el terminal.
+fg() {
+  case $COLOR_DEPTH in
+    24) printf '\033[38;2;%s;%s;%sm' "$1" "$2" "$3" ;;
+    8)  printf '\033[38;5;%sm' "$4" ;;
+    4)  printf '\033[%sm' "$5" ;;
+  esac
+}
+# Lo mismo para el color de FONDO. Hace falta para los logotipos: pintando el
+# fondo de una celda y el texto de otra se meten dos píxeles en cada carácter.
+bg() {
+  case $COLOR_DEPTH in
+    24) printf '\033[48;2;%s;%s;%sm' "$1" "$2" "$3" ;;
+    8)  printf '\033[48;5;%sm' "$4" ;;
+    4)  printf '\033[%sm' "$5" ;;
+  esac
+}
+
+if (( COLOR_DEPTH )); then
+  # ── Paleta ───────────────────────────────────────────────────────────
+  # Tomada de los dos logotipos. El panel NO usa el color por defecto del
+  # terminal: si lo hiciera, heredaria el verde, el ambar o lo que tenga el
+  # tema de cada uno y no habria tematica que valga. Aqui todo va explicito.
+  PH=$(fg  240  57  43 203 '1;31')   # Pi-hole  rojo    #F0392B
+  PHD=$(fg 170  34  20 124 '0;31')   # Pi-hole  granate
+  PHG=$(fg  34 200  30  40 '1;32')   # Pi-hole  hoja    #22C81E
+  UB=$(fg   43 196 220  44 '1;36')   # Unbound  cian    #2BC4DC
+  UBN=$(fg  92  92 205  62 '1;34')   # Unbound  galon
+  UBC=$(fg  34 211 238  45 '0;36')
+  TS=$(fg  150 150 150 245 '0;37')   # Tailscale, gris de su marca
+  # ── Interfaz ─────────────────────────────────────────────────────────
+  TXT=$(fg 226 224 218 254 '0;37')   # texto normal, hueso sobre negro
+  MUT=$(fg 122 130 144 245 '1;30')   # secundario: valores, notas
+  LIN=$(fg  72  84 102 240 '1;30')   # bordes del cuadro
+  NUM=$(fg 255 255 255 231 '1;37')   # los numeros del menu, lo que se teclea
+  # ── Estado ───────────────────────────────────────────────────────────
+  GRN=$(fg  34 197  94  77 '0;32')   # bien
+  YEL=$(fg 250 204  21 220 '1;33')   # ojo
+  RED=$(fg 239  68  68 203 '0;31')   # mal
+  BLU="$UB"
+  DIM=$'\033[2m'; BLD=$'\033[1m'; NC=$'\033[0m'
 else
-  RED=''; GRN=''; YEL=''; BLU=''; CYN=''; MAG=''; DIM=''; BLD=''; NC=''
+  PH=''; PHD=''; PHG=''; UB=''; UBN=''; UBC=''; TS=''
+  TXT=''; MUT=''; LIN=''; NUM=''
+  GRN=''; YEL=''; RED=''; BLU=''
+  RED=''; GRN=''; YEL=''; BLU=''; DIM=''; BLD=''; NC=''
 fi
 
 # Bordes: Unicode si la terminal lo soporta, ASCII si no.
@@ -47,38 +113,253 @@ fi
 # exactamente la que usa bash para contar caracteres en ${#cadena}. Mirando
 # solo las variables se elegían bordes Unicode con LC_ALL=C y se descuadraba.
 if [[ "$(locale charmap 2>/dev/null)" == "UTF-8" ]]; then
-  TL='┌'; TR='┐'; BL='└'; BR='┘'; HZ='─'; VT='│'; LT='├'; RT='┤'
-  I_EST='◆'; I_CFG='▣'; I_TS='▲'; I_SYS='■'; DOT='●'
-  LOGO1='   .~.  '; LOGO2='  ( o ) '; LOGO3="   \`~'  "
+  UTF8_OK=1
+  TL='╔'; TR='╗'; BL='╚'; BR='╝'; HZ='═'; VT='║'; LT='╠'; RT='╣'
+  I_EST='◆'; I_CFG='▣'; I_TS='▲'; I_SYS='■'; I_SEC='▼'; DOT='●'
 else
+  UTF8_OK=0
   TL='+'; TR='+'; BL='+'; BR='+'; HZ='-'; VT='|'; LT='+'; RT='+'
-  I_EST='*'; I_CFG='#'; I_TS='^'; I_SYS='='; DOT='o'
-  LOGO1='   ___  '; LOGO2='  ( o ) '; LOGO3="   ---  "
+  I_EST='*'; I_CFG='#'; I_TS='^'; I_SYS='='; I_SEC='!'; DOT='o'
 fi
 
-BOXW=54   # ancho interior del cuadro
+BOXW=64   # ancho interior del cuadro (se recalcula segun la ventana)
 
-# Longitud visible de una cadena, sin depender de la locale:
-#   1) quita los códigos de color ANSI (ocupan bytes pero no se ven)
-#   2) borra los bytes de continuación UTF-8 (10xxxxxx), así de cada carácter
-#      multibyte queda solo su primer byte
-#   3) cuenta los bytes restantes = número real de caracteres
-# Hacerlo con ${#cadena} fallaba: con LC_ALL=C bash cuenta bytes y cualquier
-# acento o '·' descuadraba el borde.
+# ── Logotipos ──────────────────────────────────────────────────────────────
+# Los logotipos de Pi-hole y Unbound en arte ASCII, al estilo de los que
+# enseñan screenfetch y neofetch. 30 columnas cada uno.
+#
+# El caracter '@' es el FONDO del dibujo — el hueco del molinillo de Pi-hole,
+# la separacion entre los dos brazos de Unbound— y no se pinta: se deja pasar
+# el fondo del terminal, que es como lo hace neofetch. Para verlo dibujado,
+# ponle un color a LOGO_BG mas abajo.
+#
+# El resto de caracteres llevan color por zonas. Las dos convenciones no son
+# iguales, ojo al retocarlos:
+#   Pi-hole  se colorea por FILA: arriba las hojas, abajo la baya
+#   Unbound  por fila tambien, salvo la 13 —la del cambio— donde manda el
+#            caracter: '%' es ya el galon azul y el resto sigue siendo cian
+LOGO_BG=''          # color del fondo '@'; vacio = no se pinta
+
+# shellcheck disable=SC2034  # por nameref desde render_logo
+LOGO_PIH=(
+  '@*+***#%@@@@@@@@@@@@@@@@@@@@@@'
+  '@#+++++++*%@@@@@@@@@@@@@@@@@@@'
+  '@@*++++++++*@@@@@@@%#**#@@@@@@'
+  '@@%++++++++++%@@@*+====#@@@@@@'
+  '@@@@*+++++**+*@%+=====*@@@@@@@'
+  '@@@@@%#*+++*#+#+===+*%@@@@@@@@'
+  '@@@@@@@@%##*%@***#%@@@@@@@@@@@'
+  '@@@@@@@@@@@%#***##%@@@@@@@@@@@'
+  '@@@@@@@@@#**********%@@@@@@@@@'
+  '@@@@@@@#*************#%@@@@@@@'
+  '@@@@@#***************###%@@@@@'
+  '@@@#***************#######%@@@'
+  '@%#######%%%######%%########%@'
+  '%#########%@@@@@@@@##########%'
+  '###########%@@@@@@%###########'
+  '%##########@@@@@@@@%#########%'
+  '@%########%@%#####%%%#######%@'
+  '@@@%#######***************#@@@'
+  '@@@@@%###***************#@@@@@'
+  '@@@@@@@%#*************#@@@@@@@'
+  '@@@@@@@@@%**********#@@@@@@@@@'
+  '@@@@@@@@@@@##*****#@@@@@@@@@@@'
+)
+# Los mismos dos dibujos reducidos a la mitad, para ventanas pequeñas. Se
+# sacaron del grande promediando la densidad de cada bloque de 2x2 y volviendo
+# a mapearla a la misma rampa de caracteres, no redibujandolos: por eso se
+# parecen.
+# shellcheck disable=SC2034  # por nameref desde render_logo
+LOGO_PIH_MIN=(
+  '=++*=@@@@@@@@@@'
+  '@*++++=@@++*@@@'
+  '@@+*+**+==+@@@@'
+  '@@@@+***#+@@@@@'
+  '@@@@+******@@@@'
+  '@@+*******##*@@'
+  '*####*===*####*'
+  '#####*@@@*#####'
+  '@*###*#**##***@'
+  '@@@********+@@@'
+  '@@@@@+***+@@@@@'
+)
+# shellcheck disable=SC2034  # por nameref desde render_logo
+LOGO_UNB_MIN=(
+  '@@=++=+@+=++=@@'
+  '=======@======='
+  '=======@======='
+  '=======@======='
+  '=======@======='
+  '====++@@@++===='
+  '=+#%++@@@++%#+='
+  '@*%%%%%%%%%%%*@'
+  '@@+%%%%%%%%%+@@'
+  '@@@@@+%%%+@@@@@'
+)
+
+# shellcheck disable=SC2034  # por nameref desde render_logo
+LOGO_UNB=(
+  '@@@@@@@%*+=+%@@@@%+=+*%@@@@@@@'
+  '@@@@#*+=====#@@@@#=====+*#@@@@'
+  '@#+=========#@@@@#=========+#@'
+  '+===========#@@@@#===========+'
+  '============#@@@@#============'
+  '============#@@@@#============'
+  '============#@@@@#============'
+  '============#@@@@#============'
+  '============#@@@@#============'
+  '============#@@@@#============'
+  '===========+@@@@@@+==========='
+  '=======+*#%@@@@@@@@%#*+======='
+  '====+*#%@@@@@@@@@@@@@@%#*+===='
+  '=+*#%%%%%%%%@@@@@@%%%%%%%%#*+='
+  '%@@%%%%%%%%%%%%%%%%%%%%%%%%@@%'
+  '@@%%%%%%%%%%%%##%%%%%%%%%%%%@@'
+  '@@@%%%%%%%%%%%%%%%%%%%%%%%%@@@'
+  '@@@@@@%%%%%%%%%%%%%%%%%%@@@@@@'
+  '@@@@@@@@@%%%%%%%%%%%%@@@@@@@@@'
+  '@@@@@@@@@@@@%%%%%%@@@@@@@@@@@@'
+)
+
+# Devuelve el color de una celda del dibujo.
+logo_color() {   # $1 PIH|UNB · $2 fila · $3 caracter · $4 nº de filas del dibujo
+  [[ "$3" == '@' ]] && { printf '%s' "$LOGO_BG"; return; }
+  # Las fronteras van en proporcion al alto para que valgan igual con el dibujo
+  # grande de 22 filas y con el reducido de 11.
+  local r=$(( $2 * 22 / $4 ))
+  if [[ "$1" == PIH ]]; then
+    if   (( r <= 6  )); then printf '%s' "$PHG"     # hojas
+    elif (( r <= 13 )); then printf '%s' "$PH"      # baya, mitad de arriba
+    else                     printf '%s' "$PHD"     # baya, mitad de abajo
+    fi
+  else
+    if   (( r <= 12 )); then printf '%s' "$UB"      # brazos cian
+    elif (( r <= 14 )); then [[ "$3" == '%' ]] && printf '%s' "$UBN" || printf '%s' "$UB"
+    else                     printf '%s' "$UBN"     # galon azul
+    fi
+  fi
+}
+
+# Pinta un dibujo, agrupando las tiradas del mismo color en una sola secuencia
+# en vez de emitir un escape por caracter.
+ASCII_OUT=()
+render_logo() {         # $1 nombre del array · $2 etiqueta PIH|UNB
+  local -n _a="$1"
+  local r i ch col prev line n=${#_a[@]}
+  ASCII_OUT=()
+  for r in "${!_a[@]}"; do
+    line=''; prev='@@'
+    for (( i=0; i<${#_a[r]}; i++ )); do
+      ch="${_a[r]:i:1}"
+      col=$(logo_color "$2" "$r" "$ch" "$n")
+      if [[ "$col" != "$prev" ]]; then line+="${NC}${col}"; prev="$col"; fi
+      # el fondo sin color se deja en blanco, que es lo que lo hace legible
+      if [[ "$ch" == '@' && -z "$LOGO_BG" ]]; then line+=' '; else line+="$ch"; fi
+    done
+    ASCII_OUT+=( "$line$NC" )
+  done
+}
+
+# Cabecera: los dos logotipos uno al lado del otro. Se compone al arrancar.
+BANNER_ROWS=()
+build_banner() {   # $1 = grande|mini
+  local -a L R
+  local hueco
+  if [[ "${1:-grande}" == mini ]]; then
+    render_logo LOGO_PIH_MIN PIH; L=( "${ASCII_OUT[@]}" )
+    render_logo LOGO_UNB_MIN UNB; R=( "${ASCII_OUT[@]}" )
+    hueco='               '                      # 15 espacios
+    R=( "${R[@]}" "$hueco" )
+  else
+    render_logo LOGO_PIH PIH; L=( "${ASCII_OUT[@]}" )
+    render_logo LOGO_UNB UNB; R=( "${ASCII_OUT[@]}" )
+    # Unbound tiene dos filas menos: se centra para que no quede colgando.
+    hueco='                              '        # 30 espacios
+    R=( "$hueco" "${R[@]}" "$hueco" )
+  fi
+  BANNER_ROWS=()
+  local i
+  for i in "${!L[@]}"; do
+    BANNER_ROWS+=( "${L[$i]}  ${R[$i]:-$hueco}" )
+  done
+}
+# ── Disposición ────────────────────────────────────────────────────────────
+# El panel se adapta a la ventana. Importa sobre todo el ANCHO: si el cuadro no
+# cabe, el terminal parte cada fila por la mitad y el dibujo se deshace. El
+# alto es menos grave — como mucho hay que subir para ver la cabecera.
+#
+# Tres tallas:
+#   grande  logotipos de 30 columnas, menú a dos columnas
+#   mini    los mismos logotipos reducidos a la mitad, 15 columnas
+#   texto   sin dibujo, para ventanas pequeñas o teléfonos de pie
+#
+# Se puede forzar con NEXO_LOGO=grande|mini|no
+term_dim() {          # $1 = lines|cols
+  local v=''
+  # `tput` es lo más fiable, pero necesita un TERM válido: por SSH o dentro de
+  # cron no siempre lo hay y falla. Por eso hay dos suplentes detrás.
+  v=$(tput "$1" 2>/dev/null) || v=''
+  if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+    if [[ "$1" == lines ]]; then
+      v=$(stty size 2>/dev/null | awk '{print $1}'); [[ "$v" =~ ^[0-9]+$ ]] || v="${LINES:-}"
+    else
+      v=$(stty size 2>/dev/null | awk '{print $2}'); [[ "$v" =~ ^[0-9]+$ ]] || v="${COLUMNS:-}"
+    fi
+  fi
+  [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )) || v=$( [[ "$1" == lines ]] && echo 24 || echo 80 )
+  printf '%s' "$v"
+}
+
+LAYOUT=texto; MENU_COLS=2
+elegir_layout() {
+  local c l w
+  c=$(term_dim cols); l=$(term_dim lines)
+  # el cuadro necesita 6 columnas de margen: 2 de sangría, 2 bordes, 2 huecos
+  w=$(( c - 6 )); (( w > 64 )) && w=64; (( w < 28 )) && w=28
+  set_boxw "$w"
+  MENU_COLS=2; (( BOXW < 50 )) && MENU_COLS=1
+  case "${NEXO_LOGO:-auto}" in
+    grande) LAYOUT=grande; return ;;
+    mini)   LAYOUT=mini;   return ;;
+    no|0)   LAYOUT=texto;  return ;;
+  esac
+  if   (( BOXW >= 62 && l >= 56 )); then LAYOUT=grande
+  elif (( BOXW >= 34 && l >= 32 )); then LAYOUT=mini
+  else                                   LAYOUT=texto
+  fi
+}
+
+# Longitud visible de una cadena: sin los códigos de color, que ocupan bytes
+# pero no se ven. Todo en bash puro — la versión anterior lanzaba sed+tr+wc+tr
+# por cada llamada, y el panel hace unas 30 por redibujado: 120 procesos cada
+# vez que se pinta el menú, que en una Raspberry se nota.
 vislen() {
-  printf '%s' "$1" \
-    | sed $'s/\033\\[[0-9;]*m//g' \
-    | LC_ALL=C tr -d '\200-\277' \
-    | LC_ALL=C wc -c | tr -d ' '
+  local s="$1" out=''
+  while [[ "$s" == *$'\033['* ]]; do
+    out+="${s%%$'\033['*}"
+    s="${s#*$'\033['}"
+    s="${s#*m}"
+  done
+  out+="$s"
+  # Sin locale UTF-8 bash cuenta BYTES, así que se quitan los de continuación
+  # (10xxxxxx) y de cada carácter multibyte queda solo el primero.
+  (( UTF8_OK )) || out="${out//[$'\x80'-$'\xbf']/}"
+  printf '%s' "${#out}"
 }
 # La línea se construye repitiendo la cadena: `tr` trabaja por bytes y
 # convertiría un '─' de 3 bytes en tres caracteres rotos.
 HLINE=''
-for ((_i=0; _i<BOXW+2; _i++)); do HLINE+="$HZ"; done
+set_boxw() {
+  BOXW=$1
+  HLINE=''
+  local _i
+  for ((_i=0; _i<BOXW+2; _i++)); do HLINE+="$HZ"; done
+}
+set_boxw "$BOXW"
 hline()  { printf '%s' "$HLINE"; }
-btop()   { printf '  %s%s%s\n' "$TL" "$(hline)" "$TR"; }
-bsep()   { printf '  %s%s%s\n' "$LT" "$(hline)" "$RT"; }
-bbot()   { printf '  %s%s%s\n' "$BL" "$(hline)" "$BR"; }
+btop()   { printf '  %s%s%s%s%s\n' "$LIN" "$TL" "$(hline)" "$TR" "$NC"; }
+bsep()   { printf '  %s%s%s%s%s\n' "$LIN" "$LT" "$(hline)" "$RT" "$NC"; }
+bbot()   { printf '  %s%s%s%s%s\n' "$LIN" "$BL" "$(hline)" "$BR" "$NC"; }
 # Si el contenido excede el ancho, el relleno saldría negativo y printf fallaría
 # rompiendo el cuadro. Con nombres de host o de distro largos pasa de verdad,
 # así que se recorta y se marca con '…'.
@@ -89,17 +370,73 @@ brow() {
     # Recorte a ciegas sobre la cadena con color: se corta por caracteres y se
     # recalcula, para no partir una secuencia ANSI por la mitad.
     while (( l > BOXW - 1 )) && [[ -n "$t" ]]; do t="${t%?}"; l=$(vislen "$t"); done
-    t="${t}…${NC}"; l=$(( $(vislen "$t") ))
+    t+="…"; l=$(( l + 1 ))
   fi
   pad=$(( BOXW - l )); (( pad < 0 )) && pad=0
-  printf '  %s %s%*s %s\n' "$VT" "$t" "$pad" '' "$VT"
+  # El ${NC} final va siempre: si el recorte se ha comido el reset de una
+  # secuencia de color, el color se derramaría sobre el borde y las filas
+  # siguientes. Como no ocupa ancho visible, no descuadra nada.
+  printf '  %s%s%s %s%*s %s%s%s\n' "$LIN" "$VT" "$NC" "$t$NC" "$pad" '' "$LIN" "$VT" "$NC"
+}
+# Rellena hasta un ancho contando caracteres visibles. `printf %-*s` no sirve:
+# cuenta BYTES, y una "é" ocupa dos, así que las columnas se descuadraban.
+pad_to() {
+  local t="$1" n="$2" l
+  l=$(vislen "$t"); (( n -= l )); (( n < 0 )) && n=0
+  printf '%s%*s' "$t" "$n" ''
+}
+# Una opción del menú: el número es lo que se teclea, así que va en blanco y
+# destacado; la etiqueta en texto normal; el valor actual, si lo hay, apagado.
+# Enseñar el valor ahí ahorra entrar solo para mirarlo.
+mi() {   # $1 número · $2 etiqueta · $3 valor (opcional)
+  local s
+  printf -v s '%s%2s%s %s%s%s' "$NUM" "$1" "$NC" "$TXT" "$2" "$NC"
+  [[ -n "${3:-}" ]] && s+=" ${MUT}${3}${NC}"
+  printf '%s' "$s"
+}
+# Cabecera de sección: icono en el color de la marca que la manda.
+sec() {  # $1 icono · $2 color · $3 título
+  brow "${2}${1}${NC}  ${BLD}${2}${3}${NC}"
+}
+# Pinta los elementos de un menú en una o dos columnas según quepa.
+menu_items() {
+  local -a it=("$@")
+  local i w
+  if (( MENU_COLS >= 2 )); then
+    w=$(( (BOXW - 3) / 2 ))
+    for (( i=0; i<${#it[@]}; i+=2 )); do
+      if (( i+1 < ${#it[@]} )); then
+        brow "  $(pad_to "${it[i]}" "$w")${it[i+1]}"
+      else
+        brow "  ${it[i]}"
+      fi
+    done
+  else
+    for i in "${!it[@]}"; do brow "  ${it[i]}"; done
+  fi
+}
+
+# Fila centrada dentro del cuadro, para los banners.
+bcenter() {
+  local t="${1:-}" l pad
+  l=$(vislen "$t"); pad=$(( (BOXW - l) / 2 )); (( pad < 0 )) && pad=0
+  brow "$(printf '%*s%s' "$pad" '' "$t")"
+}
+banner_rows() { printf '%s\n' "${BANNER_ROWS[@]}"; }
+# Portada a pantalla completa: se usa al instalar y con `nexo-dns.sh banner`.
+splash() {
+  local r
+  echo
+  while IFS= read -r r; do printf '%s\n' "$r"; done < <(banner_rows)
+  echo
+  printf '   %s\n\n' "${DIM}DNS privado, filtrado y recursivo${NC}"
 }
 
 info() { echo "${BLU}[i]${NC} $*"; }
 ok()   { echo "${GRN}[✓]${NC} $*"; }
 warn() { echo "${YEL}[!]${NC} $*"; }
 err()  { echo "${RED}[✗]${NC} $*"; }
-step() { echo; echo "${BLD}── $* ${NC}"; }
+step() { echo; echo "${PH}══${NC} ${BLD}${TXT}$*${NC}"; }
 pause(){ [[ -t 0 ]] || return 0; echo; read -rp "  ${DIM}Enter para continuar...${NC} " _ || true; }
 ask()  { local p="$1" d="${2:-}" r; read -rp "  $p " r || true; echo "${r:-$d}"; }
 yes_no(){ local r; r=$(ask "$1 [s/N]"); [[ "$r" =~ ^[sSyY]$ ]]; }
@@ -143,6 +480,50 @@ cpu_temp() {
   elif [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
     awk '{printf "%.1f°C\n", $1/1000}' /sys/class/thermal/thermal_zone0/temp
   fi
+}
+
+# ══════════════════════════════════════════ ¿máquina en casa o VPS pública? ════
+# No es un detalle cosmético: cambia cuál es el consejo correcto y cuál es el
+# riesgo. En casa el DNS se reparte por el DHCP del router y el peor caso es
+# quedarte sin internet. En una VPS no hay DHCP que tocar, y en cambio aparece
+# un riesgo que en casa no existe: dejar un resolver recursivo abierto al
+# mundo. Los resolvers abiertos se usan para amplificar ataques DDoS — una
+# consulta de 60 bytes devuelve 4 KB — y acabas con la VPS suspendida por abuso.
+IS_VPS=0; PLATFORM=""
+detect_platform() {
+  local virt vendor
+  # Una Raspberry o un mini-PC en casa: hardware físico, no hay más que mirar.
+  if [[ -r /proc/device-tree/model ]]; then
+    PLATFORM="$MODEL"; IS_VPS=0; return
+  fi
+  vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
+  case "$vendor" in
+    *Amazon*)       PLATFORM="Amazon EC2"   ; IS_VPS=1 ;;
+    *DigitalOcean*) PLATFORM="DigitalOcean" ; IS_VPS=1 ;;
+    *Google*)       PLATFORM="Google Cloud" ; IS_VPS=1 ;;
+    *Hetzner*)      PLATFORM="Hetzner"      ; IS_VPS=1 ;;
+    *Vultr*)        PLATFORM="Vultr"        ; IS_VPS=1 ;;
+    *Microsoft*)    PLATFORM="Azure"        ; IS_VPS=1 ;;
+    *OVH*|*Oracle*) PLATFORM="$vendor"      ; IS_VPS=1 ;;
+    *Scaleway*|*Linode*|*Akamai*) PLATFORM="$vendor"; IS_VPS=1 ;;
+    *)
+      virt=$(systemd-detect-virt 2>/dev/null) || virt=none
+      if [[ "$virt" != none ]]; then PLATFORM="virtualizado ($virt)"; IS_VPS=1
+      else PLATFORM="${MODEL:-hardware físico}"; IS_VPS=0; fi ;;
+  esac
+  # Una IP pública directa en la interfaz zanja la duda: esto da a internet.
+  local a
+  a=$(ip -4 -br addr show scope global 2>/dev/null | awk 'NR==1{sub(/\/.*/,"",$3); print $3}')
+  if [[ -n "$a" ]] && ! is_private_ip "$a"; then IS_VPS=1; fi
+}
+
+is_private_ip() {
+  case "$1" in
+    10.*|192.168.*|127.*|169.254.*) return 0 ;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 0 ;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 0 ;;  # CGNAT/tailnet
+    *) return 1 ;;
+  esac
 }
 
 # ══════════════════════════════════════ systemd-resolved: el choque de Ubuntu ══
@@ -282,13 +663,29 @@ find_root_hints() {
      && grep -q 'A.ROOT-SERVERS.NET' /var/lib/unbound/root.hints.new; then
     mv /var/lib/unbound/root.hints.new /var/lib/unbound/root.hints
     chown unbound:unbound /var/lib/unbound/root.hints 2>/dev/null || true
+    echo /var/lib/unbound/root.hints
+    return
   fi
-  echo /var/lib/unbound/root.hints
+  # Sin fichero y sin descarga, devolver la ruta igualmente dejaba en la config
+  # un  root-hints: "/var/lib/unbound/root.hints"  que no existe. Unbound se
+  # niega a arrancar y el instalador moría con un error que no señalaba a esto.
+  # Unbound trae las direcciones de los servidores raíz compiladas dentro, así
+  # que omitir la directiva es correcto: solo se pierde poder actualizarlas
+  # sin actualizar el paquete.
+  rm -f /var/lib/unbound/root.hints.new
+  echo ""
 }
 
 write_unbound_conf() {
   detect_hw
-  local hints; hints=$(find_root_hints)
+  local hints hints_line
+  hints=$(find_root_hints)
+  if [[ -n "$hints" ]]; then
+    hints_line="    root-hints: \"$hints\""
+  else
+    hints_line='    # sin root.hints: se usan los servidores raíz que Unbound trae dentro'
+    warn "No hay fichero root.hints y no se ha podido descargar; se usan los internos"
+  fi
   local anchor_line='    auto-trust-anchor-file: "/var/lib/unbound/root.key"'
   if grep -rqs 'auto-trust-anchor-file' /etc/unbound/unbound.conf.d/ \
        --exclude="$(basename "$UNBOUND_CONF")" 2>/dev/null; then
@@ -389,7 +786,7 @@ server:
     serve-expired-reply-ttl: 30
 
     ### Raíz y DNSSEC #########################################################
-    root-hints: "$hints"
+$hints_line
 $anchor_line
 
 remote-control:
@@ -477,12 +874,20 @@ EOF
 
 # ══════════════════════════════════════════════════════════ INSTALACIÓN ════════
 do_install() {
-  clear_screen; step "Instalación de Pi-hole + Unbound"
-  detect_os; detect_hw
+  clear_screen; splash
+  step "Instalación de Pi-hole + Unbound"
+  detect_os; detect_hw; detect_platform
   echo "  Sistema : $OS_NAME"
   echo "  Equipo  : $MODEL · ${RAM_MB} MB · $CORES núcleos"
+  echo "  Entorno : $PLATFORM"
   echo "  IP      : $LISTEN_IP"
   echo "  Puertos : Pi-hole $PIHOLE_PORT · Unbound $UNBOUND_PORT · Web $WEB_PORT"
+  if (( IS_VPS )); then
+    echo
+    warn "Esto es una máquina expuesta a internet, no una Raspberry en casa."
+    warn "Al terminar hay que cerrar el DNS al mundo, o cualquiera podrá usarlo"
+    warn "para amplificar ataques. Se ofrecerá al final."
+  fi
   echo
   yes_no "¿Continuar?" || { info "Cancelado"; pause; return; }
 
@@ -533,9 +938,27 @@ do_install() {
   echo "  DNS       : $LISTEN_IP:$PIHOLE_PORT → Unbound 127.0.0.1#$UNBOUND_PORT"
   echo "  Copia     : $bk"
   echo
-  warn "Falta lo más importante: que tus equipos lo usen. En el DHCP de tu"
-  warn "router pon $LISTEN_IP como ÚNICO servidor DNS. Si dejas uno público"
-  warn "de secundario, el filtrado se salta de forma intermitente."
+
+  if (( IS_VPS )); then
+    step "Cerrar el DNS a internet"
+    warn "En una VPS no hay router al que apuntar: se llega por Tailscale."
+    warn "Y hay que cerrar el 53 al mundo antes de que lo encuentre un escáner."
+    echo
+    if ! fw_active; then
+      yes_no "¿Pongo el cortafuegos ahora? (recomendado)" && install_firewall
+    else
+      ok "El cortafuegos de nexo-dns ya está puesto"
+    fi
+    echo
+    info "Para usarlo desde tus equipos:"
+    echo "    1) ${BLD}sudo bash $0${NC} → Tailscale → Instalar, y luego ${BLD}sudo tailscale up${NC}"
+    echo "    2) En login.tailscale.com/admin/dns pon esta máquina como"
+    echo "       nameserver global y marca «Override local DNS»"
+  else
+    warn "Falta lo más importante: que tus equipos lo usen. En el DHCP de tu"
+    warn "router pon $LISTEN_IP como ÚNICO servidor DNS. Si dejas uno público"
+    warn "de secundario, el filtrado se salta de forma intermitente."
+  fi
   pause
 }
 
@@ -606,14 +1029,59 @@ change_pihole_port() {
 change_web_port() {
   clear_screen; step "Puerto del panel web"
   [[ $PH_MAJOR -ge 6 ]] || { err "Pi-hole v6 no está instalado"; pause; return; }
-  echo "  Actual: ${BLD}$WEB_PORT${NC}"
+  local cur; cur=$(ph_get webserver.port)
+  echo "  Actual: ${BLD}${cur:-$WEB_PORT}${NC}"
   local np; np=$(ask "Nuevo puerto web:")
   valid_port "$np" || { err "Puerto inválido"; pause; return; }
-  backup_now >/dev/null
-  ph_set webserver.port "$np,[::]:$np"
-  systemctl restart pihole-FTL; sleep 2
-  WEB_PORT="$np"; save_conf
-  ok "Panel en http://$LISTEN_IP:$np/admin"
+  [[ "$np" == "$PIHOLE_PORT" || "$np" == "$UNBOUND_PORT" ]] && {
+    err "Ese puerto ya lo usa el DNS"; pause; return; }
+  if port_taken_by_other "$np" pihole-FTL; then
+    err "El puerto $np ya está ocupado:"; ss -tulpn 2>/dev/null | grep ":$np " | sed 's/^/    /'
+    pause; return
+  fi
+
+  # El valor de webserver.port no es un número: es una lista con sufijos.
+  # Por defecto Pi-hole v6 trae  80o,443os,[::]:80o,[::]:443os
+  #   o = opcional (si no puede atarlo, no aborta)   s = TLS
+  # Escribir "$np,[::]:$np" a secas —como se hacía antes— borraba el 443 y
+  # dejaba el panel sin HTTPS. Aquí solo se sustituye el número del puerto
+  # HTTP y se respeta todo lo demás tal y como estuviera.
+  local new
+  new=$(awk -v old="$WEB_PORT" -v new="$np" 'BEGIN{
+      n = split(ARGV[1], parts, ",")
+      out = ""
+      for (i = 1; i <= n; i++) {
+        p = parts[i]
+        # separa un posible prefijo "[::]:" del número y sus sufijos
+        pre = ""; rest = p
+        if (sub(/^\[::\]:/, "", rest)) pre = "[::]:"
+        num = rest; sub(/[^0-9].*$/, "", num)
+        suf = substr(rest, length(num) + 1)
+        # solo se toca el puerto HTTP (sin sufijo "s"); el de TLS se respeta
+        if (num == old && suf !~ /s/) num = new
+        out = out (out == "" ? "" : ",") pre num suf
+      }
+      print out
+    }' "${cur:-$WEB_PORT}")
+  [[ -z "$new" ]] && new="$np,[::]:$np"
+
+  local bk; bk=$(backup_now); info "Copia en $bk"
+  echo "  ${DIM}$cur${NC}  →  ${BLD}$new${NC}"
+  ph_set webserver.port "$new" || { pause; return; }
+  systemctl restart pihole-FTL; sleep 3
+
+  # Verificación real: que algo esté escuchando de verdad en el puerto nuevo.
+  # Antes esto no se comprobaba y, si el puerto no se podía atar, te quedabas
+  # sin panel web y sin aviso.
+  if ss -tlnH 2>/dev/null | awk -v p="$np" '{n=split($4,a,":"); if(a[n]==p) f=1} END{exit !f}'; then
+    WEB_PORT="$np"; save_conf
+    ok "Panel en http://$LISTEN_IP:$np/admin"
+  else
+    err "Nadie escucha en el puerto $np; volviendo a la configuración anterior"
+    ph_set webserver.port "$cur"
+    systemctl restart pihole-FTL; sleep 2
+    warn "Panel de nuevo en el puerto $WEB_PORT"
+  fi
   pause
 }
 
@@ -787,9 +1255,27 @@ EOF
   local lm; lm=$(ph_get dns.listeningMode)
   if [[ "$lm" == "ALL" ]]; then
     ok "Pi-hole escucha en todas las interfaces: el tailnet llega"
+    # ALL significa "respondo a quien sea". En casa, detrás del router, da
+    # igual. En una VPS con IP pública eso es un resolver abierto: se usa para
+    # amplificar DDoS y termina con la máquina suspendida por abuso.
+    if (( IS_VPS )) && ! fw_active; then
+      echo
+      err "Pero esto es una máquina pública ($PLATFORM) y no hay cortafuegos."
+      warn "Con listeningMode=ALL y el 53 abierto eres un resolver DNS abierto."
+      yes_no "¿Cierro el DNS a internet dejando pasar solo el tailnet?" \
+        && install_firewall
+    fi
   elif [[ -n "$lm" ]]; then
     warn "Pi-hole en listeningMode=$lm: los equipos del tailnet NO podrán usarlo"
-    yes_no "¿Lo pongo en ALL?" && { ph_set dns.listeningMode ALL; systemctl restart pihole-FTL; }
+    if (( IS_VPS )) && ! fw_active; then
+      warn "Ojo: esta máquina es pública ($PLATFORM). Poner ALL sin cortafuegos"
+      warn "la convierte en un resolver abierto. Primero pon el cortafuegos"
+      warn "(panel → Seguridad) y luego vuelve aquí."
+      yes_no "¿Poner ALL de todas formas?" \
+        && { ph_set dns.listeningMode ALL; systemctl restart pihole-FTL; }
+    else
+      yes_no "¿Lo pongo en ALL?" && { ph_set dns.listeningMode ALL; systemctl restart pihole-FTL; }
+    fi
   fi
 
   echo
@@ -935,17 +1421,22 @@ manage_lists() {
   local o; o=$(ask "Opción:")
   case "$o" in
     1)
-      local e a c
+      local e a c added=0 n
       for e in \
         "https://big.oisd.nl/|OISD Big - equilibrada, pocos falsos positivos" \
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/multi.txt|HaGeZi Multi - muy buena calidad" \
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.txt|HaGeZi Threat Intelligence - malware y phishing" \
         "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt|AdGuard DNS filter"; do
         a="${e%%|*}"; c="${e##*|}"
-        pihole-FTL sqlite3 /etc/pihole/gravity.db \
-          "INSERT OR IGNORE INTO adlist (address, comment) VALUES ('$a','$c');" 2>/dev/null && ok "$c"
+        # changes() distingue entre insertada e ignorada por duplicada. Antes
+        # se anunciaba "añadida" siempre, aunque la lista ya estuviera puesta.
+        n=$(pihole-FTL sqlite3 /etc/pihole/gravity.db \
+              "INSERT OR IGNORE INTO adlist (address, comment) VALUES ('$a','$c'); SELECT changes();" 2>/dev/null)
+        if [[ "$n" == "1" ]]; then ok "$c"; added=$((added+1))
+        else info "${DIM}ya estaba:${NC} $c"; fi
       done
       echo
+      (( added == 0 )) && { info "No había ninguna nueva que añadir"; pause; return; }
       yes_no "¿Actualizar gravity ahora? (tarda unos minutos)" && pihole updateGravity
       ;;
     2) pihole updateGravity ;;
@@ -956,17 +1447,23 @@ manage_lists() {
 # ══════════════════════════════════════════════════════════════ ESTADO ═════════
 show_status() {
   clear_screen; step "Estado"
-  detect_os; detect_hw
+  detect_os; detect_hw; detect_platform
   echo "  Sistema  : $OS_NAME"
   echo "  Equipo   : $MODEL · ${RAM_MB} MB · $CORES núcleos"
-  echo "  IP       : $LISTEN_IP     Pi-hole v${PH_MAJOR}"
-  echo "  Puertos  : Pi-hole $PIHOLE_PORT · Unbound $UNBOUND_PORT · Web $WEB_PORT"
+  echo "  Entorno  : $PLATFORM$( (( IS_VPS )) && printf ' %s' "${YEL}· expuesto a internet${NC}" )"
+  echo "  IP       : $LISTEN_IP     ${PH}Pi-hole${NC} v${PH_MAJOR}"
+  echo "  Puertos  : ${PH}Pi-hole${NC} $PIHOLE_PORT · ${UB}Unbound${NC} $UNBOUND_PORT · Web $WEB_PORT"
   echo
-  local s
+  local s col
   for s in unbound pihole-FTL tailscaled; do
-    if systemctl is-active --quiet "$s" 2>/dev/null; then echo "  ${GRN}${DOT}${NC} $s"
-    elif systemctl cat "$s" >/dev/null 2>&1;        then echo "  ${RED}${DOT}${NC} $s (parado)"
-    else echo "  ${DIM}o $s (no instalado)${NC}"; fi
+    case "$s" in
+      unbound)     col="$UB"  ;;
+      pihole-FTL)  col="$PH"  ;;
+      *)           col="$TS"  ;;
+    esac
+    if systemctl is-active --quiet "$s" 2>/dev/null; then echo "  ${GRN}${DOT}${NC} ${col}${s}${NC}"
+    elif systemctl cat "$s" >/dev/null 2>&1;        then echo "  ${RED}${DOT}${NC} ${col}${s}${NC} (parado)"
+    else echo "  ${DIM}${DOT} $s (no instalado)${NC}"; fi
   done
   echo
   echo "  ${BLD}Resolución${NC}"
@@ -974,9 +1471,9 @@ show_status() {
   r2=$(dig_short +time=3 google.com @127.0.0.1 -p "$UNBOUND_PORT")
   r1=$(dig_short +time=3 google.com @127.0.0.1 -p "$PIHOLE_PORT")
   bl=$(dig_short doubleclick.net @127.0.0.1 -p "$PIHOLE_PORT")
-  echo "    Unbound :$UNBOUND_PORT → ${r2:-${RED}sin respuesta${NC}}"
-  echo "    Pi-hole :$PIHOLE_PORT → ${r1:-${RED}sin respuesta${NC}}"
-  echo "    Bloqueo       → ${bl:-(vacío)}"
+  echo "    ${UB}Unbound${NC} :$UNBOUND_PORT → ${r2:-${RED}sin respuesta${NC}}"
+  echo "    ${PH}Pi-hole${NC} :$PIHOLE_PORT → ${r1:-${RED}sin respuesta${NC}}"
+  echo "    ${PHD}Bloqueo${NC}       → ${bl:-(vacío)}"
   if need unbound-control; then
     local st q h
     st=$(unbound-control stats_noreset 2>/dev/null)
@@ -984,7 +1481,7 @@ show_status() {
     h=$(awk -F= '/^total.num.cachehits=/{print $2}' <<<"$st")
     if [[ -n "${q:-}" && "${q:-0}" -gt 0 ]]; then
       echo
-      echo "  ${BLD}Caché de Unbound${NC}"
+      echo "  ${BLD}${UBC}Caché de Unbound${NC}"
       awk -v h="${h:-0}" -v q="$q" 'BEGIN{printf "    %d consultas · %d aciertos (%.1f%%)\n", q, h, (h/q)*100}'
       echo "    recursión media: $(awk -F= '/^total.recursion.time.avg=/{print $2}' <<<"$st")s"
     fi
@@ -1039,13 +1536,38 @@ health_check() {
     cl=$(pihole-FTL sqlite3 "$FTL_DB" "SELECT COUNT(DISTINCT client) FROM query_storage WHERE timestamp > strftime('%s','now','-1 day');" 2>/dev/null)
     echo "    ${qn:-0} consultas de ${cl:-0} cliente(s) en 24 h"
     if [[ "${cl:-0}" -le 2 ]]; then
-      echo "    ${YEL}!${NC} Muy pocos clientes. Una casa normal tiene 5-20 aparatos."
-      echo "      ${DIM}Revisa el DHCP del router: debe repartir $LISTEN_IP como${NC}"
-      echo "      ${DIM}ÚNICO DNS. Un secundario público salta el filtrado.${NC}"
+      echo "    ${YEL}!${NC} Muy pocos clientes."
+      if (( IS_VPS )); then
+        echo "      ${DIM}En una VPS los equipos entran por Tailscale: revisa que${NC}"
+        echo "      ${DIM}esté marcado «Override local DNS» en el panel del tailnet.${NC}"
+      else
+        echo "      ${DIM}Una casa normal tiene 5-20 aparatos. Revisa el DHCP del${NC}"
+        echo "      ${DIM}router: debe repartir $LISTEN_IP como ÚNICO DNS. Un${NC}"
+        echo "      ${DIM}secundario público salta el filtrado.${NC}"
+      fi
     else
       echo "    ${GRN}✓${NC} La red lo está usando"
     fi
   fi
+
+  # ── Exposición ──
+  # En una máquina pública esto importa más que cualquier prueba de resolución:
+  # un resolver abierto no se nota hasta que llega el aviso de abuso.
+  if (( IS_VPS )); then
+    echo; echo "  ${BLD}Exposición${NC}"
+    local lm; lm=$(ph_get dns.listeningMode)
+    if fw_active; then
+      echo "    ${GRN}✓${NC} cortafuegos de nexo-dns activo"
+    elif [[ "$lm" == "ALL" ]]; then
+      echo "    ${RED}✗${NC} listeningMode=ALL sin cortafuegos: resolver DNS ABIERTO"
+      echo "      ${DIM}panel → Seguridad → cortafuegos${NC}"
+      fails=$((fails+1))
+    else
+      echo "    ${YEL}!${NC} sin cortafuegos, pero listeningMode=$lm limita el alcance"
+      echo "      ${DIM}aun así conviene cerrarlo: panel → Seguridad${NC}"
+    fi
+  fi
+
   echo
   (( fails == 0 )) && ok "Todo correcto" || err "$fails prueba(s) fallidas"
   pause
@@ -1087,44 +1609,260 @@ backups_menu() {
   pause
 }
 
+# ═══════════════════════════════════════════════════════════ SEGURIDAD ═════════
+FW_NFT=/etc/nexo-dns-firewall.nft
+FW_UNIT=/etc/systemd/system/nexo-dns-firewall.service
+
+fw_active() { nft list table inet nexo_dns >/dev/null 2>&1; }
+
+# La IP pública se pregunta por DNS, no por HTTP: es una consulta normal a
+# OpenDNS, sin cabeceras ni cookies, y encaja con lo que ya hace esta máquina.
+public_ip() { dig +short +time=3 +tries=1 myip.opendns.com @resolver1.opendns.com 2>/dev/null | grep -v '^;;' | head -1; }
+
+show_exposure() {
+  clear_screen; step "Exposición a internet"
+  detect_platform
+  local pub lm
+  echo "  Plataforma : ${BLD}$PLATFORM${NC}"
+  echo "  IP local   : ${BLD}$LISTEN_IP${NC}"
+  pub=$(public_ip)
+  echo "  IP pública : ${BLD}${pub:-no se ha podido averiguar}${NC}"
+  echo
+
+  echo "  ${BLD}Quién está escuchando${NC}"
+  ss -tulpnH 2>/dev/null \
+    | awk '{ n=split($5,a,":"); p=a[n];
+             if (p==53 || p==5335 || p==80 || p==443 || p==8080) print "    " $1 "  " $5 "  " $NF }' \
+    | sort -u | sed 's/users:((//;s/))$//'
+  echo
+
+  # ── Lo que de verdad decide si eres un resolver abierto ──
+  echo "  ${BLD}Modo de escucha de Pi-hole${NC}"
+  lm=$(ph_get dns.listeningMode)
+  case "$lm" in
+    LOCAL)  ok "listeningMode=LOCAL · solo responde a tu propia subred" ;;
+    ALL)    err "listeningMode=ALL · responde a CUALQUIERA que pregunte"
+            (( IS_VPS )) && {
+              echo "      ${RED}Esto es un resolver DNS abierto en una máquina pública.${NC}"
+              echo "      ${DIM}Se usa para amplificar ataques DDoS y acaba en suspensión${NC}"
+              echo "      ${DIM}de la VPS por abuso. Ponle un cortafuegos (opción 2).${NC}"; } ;;
+    BIND|SINGLE) ok "listeningMode=$lm · atado a una interfaz concreta" ;;
+    *)      warn "listeningMode=${lm:-desconocido}" ;;
+  esac
+  echo
+
+  echo "  ${BLD}Cortafuegos${NC}"
+  if ! need nft; then
+    warn "nftables no está instalado"
+  elif fw_active; then
+    ok "Reglas de nexo-dns activas"
+    nft list table inet nexo_dns 2>/dev/null | grep -E 'dport|saddr' | sed 's/^/      /'
+  else
+    if (( IS_VPS )); then
+      warn "Sin reglas propias. En una VPS pública conviene poner el DNS"
+      warn "a resguardo (opción 2)."
+    else
+      info "Sin reglas propias (en una red doméstica no suele hacer falta)"
+    fi
+  fi
+  pause
+}
+
+install_firewall() {
+  clear_screen; step "Cortafuegos del DNS"
+  need nft || {
+    warn "Hace falta nftables."
+    yes_no "¿Lo instalo?" || { pause; return; }
+    apt-get install -y nftables || { err "No se pudo instalar"; pause; return; }
+  }
+  echo
+  echo "  Se cierra el DNS ($PIHOLE_PORT) y el panel web ($WEB_PORT) a internet,"
+  echo "  dejándolos abiertos solo para:"
+  echo "    · la propia máquina (loopback)"
+  echo "    · redes privadas: 10/8, 172.16/12, 192.168/16"
+  echo "    · el tailnet de Tailscale: 100.64/10"
+  echo
+  echo "  ${BLD}El SSH no se toca.${NC} La política de la cadena es ${BLD}accept${NC} y solo"
+  echo "  se descartan esos puertos concretos, así que esto ${BLD}no puede${NC}"
+  echo "  dejarte fuera de la máquina."
+  echo
+  yes_no "¿Aplicar?" || { pause; return; }
+
+  # `table` antes de `delete` crea la tabla si no existe: así el delete nunca
+  # falla en la primera ejecución y el fichero es idempotente.
+  cat > "$FW_NFT" <<EOF
+#!/usr/sbin/nft -f
+# Generado por nexo-dns.sh v$NEXO_VERSION el $(date '+%Y-%m-%d %H:%M')
+# Cierra el DNS y el panel web a internet. No toca el SSH ni nada más.
+table inet nexo_dns
+delete table inet nexo_dns
+
+table inet nexo_dns {
+    set confiables {
+        type ipv4_addr
+        flags interval
+        elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }
+    }
+    chain input {
+        type filter hook input priority -10; policy accept;
+        iif lo accept
+        ip saddr @confiables accept
+        ip6 saddr { fd00::/8, fe80::/10 } accept
+        udp dport { $PIHOLE_PORT, $UNBOUND_PORT } drop
+        tcp dport { $PIHOLE_PORT, $UNBOUND_PORT } drop
+        tcp dport $WEB_PORT drop
+    }
+}
+EOF
+  chmod 644 "$FW_NFT"
+
+  if ! nft -c -f "$FW_NFT" 2>/dev/null; then
+    err "Las reglas no son válidas:"; nft -c -f "$FW_NFT" 2>&1 | sed 's/^/    /'
+    rm -f "$FW_NFT"; pause; return 1
+  fi
+  nft -f "$FW_NFT" || { err "No se pudieron cargar"; pause; return 1; }
+  ok "Reglas cargadas"
+
+  local nftbin; nftbin=$(command -v nft)
+  cat > "$FW_UNIT" <<EOF
+[Unit]
+Description=Cortafuegos del DNS de nexo-dns
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$nftbin -f $FW_NFT
+ExecStop=$nftbin delete table inet nexo_dns
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable nexo-dns-firewall.service >/dev/null 2>&1 && ok "Se reaplica en cada arranque"
+
+  # Comprobación real: desde la propia máquina se tiene que seguir resolviendo.
+  sleep 1
+  if dig +short +time=5 google.com @127.0.0.1 -p "$PIHOLE_PORT" >/dev/null 2>&1; then
+    ok "El DNS sigue funcionando desde la máquina"
+  else
+    err "El DNS ha dejado de responder — quitando las reglas"
+    nft delete table inet nexo_dns 2>/dev/null || true
+    systemctl disable nexo-dns-firewall.service >/dev/null 2>&1 || true
+    rm -f "$FW_NFT" "$FW_UNIT"; systemctl daemon-reload
+  fi
+  echo
+  warn "Esto es el cortafuegos DEL SISTEMA. Si tu proveedor tiene además"
+  warn "grupos de seguridad (AWS, Azure, GCP...), revísalos también: son"
+  warn "una segunda puerta, por delante de esta."
+  pause
+}
+
+remove_firewall() {
+  clear_screen; step "Quitar el cortafuegos"
+  fw_active || [[ -f "$FW_UNIT" ]] || { info "No hay nada que quitar"; pause; return; }
+  yes_no "¿Seguro? El DNS volverá a estar abierto a internet" || { pause; return; }
+  nft delete table inet nexo_dns 2>/dev/null || true
+  systemctl disable --now nexo-dns-firewall.service >/dev/null 2>&1 || true
+  rm -f "$FW_NFT" "$FW_UNIT"
+  systemctl daemon-reload
+  ok "Reglas retiradas"
+  pause
+}
+
+security_menu() {
+  while true; do
+    clear_screen; step "Seguridad"
+    echo
+    echo "    1) Ver exposición a internet"
+    echo "    2) Cerrar el DNS y el panel a internet (cortafuegos)"
+    echo "    3) Quitar el cortafuegos"
+    echo "    0) Volver"
+    echo
+    local o; o=$(ask "Opción:")
+    case "$o" in
+      1) show_exposure ;;
+      2) install_firewall ;;
+      3) remove_firewall ;;
+      0|"") return ;;
+    esac
+  done
+}
+
 # ══════════════════════════════════════════════════════════════ PANEL ══════════
 panel() {
+  # Sin terminal, `read` devuelve vacío al instante y el menú giraría en un
+  # bucle infinito quemando CPU. Pasa de verdad con `curl ... | sudo bash`.
+  if [[ ! -t 0 ]]; then
+    err "El panel necesita un terminal interactivo."
+    echo "  Descarga el script y ejecútalo, en vez de pasarlo por una tubería:"
+    echo "    ${BLD}curl -fsSLO https://raw.githubusercontent.com/Dark-admin/pihole-unbound-manager/main/nexo-dns.sh${NC}"
+    echo "    ${BLD}sudo bash nexo-dns.sh${NC}"
+    echo "  O usa una orden directa:  ${BLD}status${NC} · ${BLD}health${NC} · ${BLD}install${NC} · ${BLD}optimize${NC}"
+    exit 1
+  fi
   while true; do
-    load_conf; detect_os
+    load_conf; detect_os; detect_platform
+    elegir_layout
     clear_screen
-    local up ph
+    local up ph ts r
     systemctl is-active --quiet unbound 2>/dev/null    && up="${GRN}${DOT}${NC}" || up="${RED}${DOT}${NC}"
     systemctl is-active --quiet pihole-FTL 2>/dev/null && ph="${GRN}${DOT}${NC}" || ph="${RED}${DOT}${NC}"
+    if   systemctl is-active --quiet tailscaled 2>/dev/null; then ts="${GRN}${DOT}${NC}"
+    elif need tailscale;                                     then ts="${RED}${DOT}${NC}"
+    else                                                          ts="${MUT}${DOT}${NC}"; fi
 
     echo
     btop
-    brow "${MAG}${LOGO1}${NC}"
-    brow "${MAG}${LOGO2}${NC} ${BLD}nexo-dns${NC} ${DIM}v$NEXO_VERSION${NC}"
-    brow "${MAG}${LOGO3}${NC} ${DIM}Pi-hole · Unbound · Tailscale${NC}"
+    case "$LAYOUT" in
+      grande|mini)
+        build_banner "$LAYOUT"
+        while IFS= read -r r; do bcenter "$r"; done < <(banner_rows)
+        bcenter "${BLD}${TXT}nexo-dns${NC} ${MUT}v$NEXO_VERSION${NC}" ;;
+      *)
+        brow ''
+        bcenter "${BLD}${TXT}nexo-dns${NC} ${MUT}v$NEXO_VERSION${NC}"
+        bcenter "${PH}Pi-hole${NC} ${MUT}·${NC} ${UB}Unbound${NC} ${MUT}·${NC} ${TS}Tailscale${NC}"
+        brow '' ;;
+    esac
     bsep
-    brow "$ph Pi-hole :$PIHOLE_PORT     $up Unbound :$UNBOUND_PORT"
-    brow "${DIM}$(hostname) · $LISTEN_IP · ${OS_NAME:0:28}${NC}"
+    brow "$ph ${TXT}Pi-hole${NC} ${MUT}:$PIHOLE_PORT${NC}   $up ${TXT}Unbound${NC} ${MUT}:$UNBOUND_PORT${NC}   $ts ${TXT}Tailscale${NC}"
+    brow "${MUT}$(hostname) · $LISTEN_IP${NC}"
+    if (( IS_VPS )); then
+      if fw_active; then
+        brow "${GRN}${DOT}${NC} ${MUT}$PLATFORM · DNS cerrado a internet${NC}"
+      else
+        brow "${YEL}${I_SEC}${NC} ${YEL}$PLATFORM · DNS abierto a internet${NC}"
+      fi
+    fi
     bsep
-    brow "${CYN}${I_EST}${NC} ${BLD}ESTADO${NC}"
-    brow "   1 Ver estado            2 Chequeo real"
+    sec "$I_EST" "$PH" "ESTADO"
+    menu_items "$(mi 1 'Ver estado')" "$(mi 2 'Chequeo real')"
     bsep
-    brow "${CYN}${I_CFG}${NC} ${BLD}CONFIGURACIÓN${NC}"
-    brow "   3 Puerto Unbound        4 Puerto Pi-hole"
-    brow "   5 Puerto web            6 IP del servidor"
-    brow "   7 Reoptimizar           8 Listas de bloqueo"
-    brow "   9 Precalentar caché"
+    sec "$I_CFG" "$PH" "DNS"
+    menu_items "$(mi 3 'Puerto Unbound' "$UNBOUND_PORT")" \
+               "$(mi 4 'Puerto Pi-hole' "$PIHOLE_PORT")" \
+               "$(mi 5 'Puerto web' "$WEB_PORT")" \
+               "$(mi 6 'IP del servidor')" \
+               "$(mi 7 'Reoptimizar Unbound')" \
+               "$(mi 8 'Listas de bloqueo')" \
+               "$(mi 9 'Precalentar caché')"
     bsep
-    brow "${CYN}${I_TS}${NC} ${BLD}TAILSCALE${NC}"
-    brow "  10 Instalar             11 Optimizar"
+    sec "$I_SEC" "$UB" "SEGURIDAD"
+    menu_items "$(mi 10 'Exposición y cortafuegos')"
     bsep
-    brow "${CYN}${I_SYS}${NC} ${BLD}SISTEMA${NC}"
-    brow "  12 Red / BBR            13 Reiniciar servicios"
-    brow "  14 Copias / restaurar   15 Instalar todo"
+    sec "$I_TS" "$TS" "TAILSCALE"
+    menu_items "$(mi 11 'Instalar')" "$(mi 12 'Optimizar')"
     bsep
-    brow "   0 Salir"
+    sec "$I_SYS" "$UB" "SISTEMA"
+    menu_items "$(mi 13 'Red / BBR')" "$(mi 14 'Reiniciar servicios')" \
+               "$(mi 15 'Copias / restaurar')" "$(mi 16 'Instalar todo')"
+    bsep
+    brow "$(mi 0 'Salir')"
     bbot
     echo
-    local c; c=$(ask "${YEL}Opción:${NC}")
+    local c; c=$(ask "${PH}▶${NC} ${TXT}Opción${NC} ${MUT}[0-16]${NC}")
     case "$c" in
       1)  show_status ;;
       2)  health_check ;;
@@ -1135,16 +1873,17 @@ panel() {
       7)  do_optimize ;;
       8)  manage_lists ;;
       9)  install_prewarm ;;
-      10) install_tailscale ;;
-      11) optimize_tailscale ;;
-      12) network_tuning ;;
-      13) clear_screen; step "Reiniciando"
+      10) security_menu ;;
+      11) install_tailscale ;;
+      12) optimize_tailscale ;;
+      13) network_tuning ;;
+      14) clear_screen; step "Reiniciando"
           systemctl restart unbound    && ok "Unbound" || err "Unbound"
           sleep 1
           systemctl restart pihole-FTL && ok "Pi-hole" || err "Pi-hole"
           pause ;;
-      14) backups_menu ;;
-      15) do_install ;;
+      15) backups_menu ;;
+      16) do_install ;;
       0)  echo; ok "Hasta luego"; exit 0 ;;
       *)  ;;
     esac
@@ -1153,13 +1892,18 @@ panel() {
 
 # ═══════════════════════════════════════════════════════════════ MAIN ═════════
 detect_os
+detect_platform
 load_conf
 case "${1:-panel}" in
   install)   do_install ;;
   status)    show_status ;;
   health)    health_check ;;
   optimize)  do_optimize ;;
+  security)  show_exposure ;;
+  firewall)  install_firewall ;;
+  banner)    splash ;;
   panel|"")  panel ;;
-  -h|--help) sed -n '2,20p' "$0" ;;
-  *) err "Orden desconocida: $1"; sed -n '2,20p' "$0"; exit 1 ;;
+  -v|--version) echo "nexo-dns $NEXO_VERSION" ;;
+  -h|--help) sed -n '2,24p' "$0" ;;
+  *) err "Orden desconocida: $1"; sed -n '2,24p' "$0"; exit 1 ;;
 esac
