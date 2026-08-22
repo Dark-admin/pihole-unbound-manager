@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-dashboard.py - Panel web para Pi-hole + Unbound
+dashboard.py - Panel web para Pi-hole o AdGuard Home + Unbound
 Autor: nexo (Dark)
+v4.2 - Sigue al motor activo: lee ENGINE de /etc/nexo-dns.conf y saca los
+       datos de gravity.db o de AdGuardHome.yaml + querylog.json.
 v4.1 - Alineado con nexo-dns.sh y endurecido para uso en red.
 
 Uso:
@@ -26,6 +28,68 @@ SUDO = [] if getattr(os, "geteuid", lambda: 1)() == 0 else ["sudo", "-n"]
 
 NEXO_CONF = "/etc/nexo-dns.conf"
 UNBOUND_CONF = "/etc/unbound/unbound.conf.d/pi-hole.conf"
+AGH_DIR = "/opt/AdGuardHome"
+AGH_YAML = AGH_DIR + "/AdGuardHome.yaml"
+AGH_LOG = AGH_DIR + "/data/querylog.json"
+
+
+def conf_value(key):
+    """Lee una clave de /etc/nexo-dns.conf, que escribe nexo-dns.sh."""
+    try:
+        with open(NEXO_CONF) as f:
+            for line in f:
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def engine():
+    """Que filtro manda: 'pihole' o 'adguard'. Lo normal es que lo diga el
+    fichero de config; si no esta (instalacion vieja), se deduce de lo que
+    haya instalado."""
+    e = conf_value("ENGINE")
+    if e in ("pihole", "adguard"):
+        return e
+    return "adguard" if os.path.isfile(AGH_YAML) else "pihole"
+
+
+def engine_label():
+    return "AdGuard Home" if engine() == "adguard" else "Pi-hole FTL"
+
+
+def engine_svc():
+    return "AdGuardHome" if engine() == "adguard" else "pihole-FTL"
+
+
+def agh_block_values(block, key):
+    """Valores de una clave-lista dentro de un bloque del YAML de AdGuard.
+    Sin PyYAML a proposito: no viene instalado de serie y el panel tiene que
+    arrancar en una Raspberry recien hecha."""
+    out, inblk, inkey = [], False, False
+    try:
+        with open(AGH_YAML, encoding="utf-8") as f:
+            for line in f:
+                s = line.rstrip("\n")
+                if re.match(r'^[A-Za-z_][A-Za-z0-9_]*:', s):
+                    inblk = s.startswith(block + ":")
+                    inkey = False
+                    continue
+                if not inblk:
+                    continue
+                if re.match(r'^  {}:'.format(re.escape(key)), s):
+                    inkey = True
+                    continue
+                if inkey:
+                    m = re.match(r'^    - (.+)$', s)
+                    if m:
+                        out.append(m.group(1).strip())
+                    elif s.startswith("  "):
+                        inkey = False
+    except OSError:
+        pass
+    return out
 
 def run(cmd):
     """Ejecuta una orden sin pasarla por un intérprete de shell."""
@@ -85,12 +149,51 @@ def dig_test(server, port=""):
     return ""
 
 def count_gravity():
+    """Dominios bloqueados. Pi-hole los tiene en gravity; AdGuard hay que
+    contarlos en los ficheros de filtros que se descarga."""
+    if engine() == "adguard":
+        total = 0
+        try:
+            d = os.path.join(AGH_DIR, "data", "filters")
+            for name in os.listdir(d):
+                if not name.endswith(".txt"):
+                    continue
+                with open(os.path.join(d, name), encoding="utf-8",
+                          errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and line[0] not in "!#":
+                            total += 1
+        except OSError:
+            return "0"
+        return str(total)
     return run(SUDO + [
         "pihole-FTL", "sqlite3", "/etc/pihole/gravity.db",
         "SELECT COUNT(*) FROM gravity;",
     ]).strip() or "0"
 
 def list_adlists():
+    if engine() == "adguard":
+        names, urls = [], []
+        try:
+            with open(AGH_YAML, encoding="utf-8") as f:
+                inblk = False
+                for line in f:
+                    s = line.rstrip("\n")
+                    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*:', s):
+                        inblk = s.startswith("filters:")
+                        continue
+                    if not inblk:
+                        continue
+                    m = re.match(r'^\s+name:\s*(.+)$', s)
+                    if m:
+                        names.append(m.group(1).strip())
+                    m = re.match(r'^\s+url:\s*(.+)$', s)
+                    if m:
+                        urls.append(m.group(1).strip())
+        except OSError:
+            return []
+        return ["{}|{}".format(n, u) for n, u in zip(names, urls)]
     try:
         sql = "SELECT COALESCE(comment, 'sin nombre') || '|' || COALESCE(address, '?') FROM adlist;"
         raw = run(SUDO + [
@@ -111,6 +214,20 @@ def port_open(port):
 def clients_24h():
     """Cuantos clientes usan de verdad este DNS. Si son muy pocos, casi seguro
     el router sigue repartiendo su propio DNS y esto esta de adorno."""
+    if engine() == "adguard":
+        # AdGuard no usa SQLite: el registro es JSON, una linea por consulta.
+        # Se mira solo la cola; recorrerlo entero en una Pi 3 se nota.
+        try:
+            with open(AGH_LOG, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-20000:]
+        except OSError:
+            return "?"
+        ips = set()
+        for line in lines:
+            m = re.search(r'"IP":"([^"]+)"', line)
+            if m:
+                ips.add(m.group(1))
+        return str(len(ips))
     sql = ("SELECT COUNT(DISTINCT client) FROM query_storage "
            "WHERE timestamp > strftime('%s','now','-1 day');")
     n = run(SUDO + [
@@ -145,17 +262,24 @@ def verify():
     # En pihole.toml v6 el valor va en la linea SIGUIENTE a "upstreams = [",
     # asi que un grep simple nunca lo encuentra. Se usa la API de Pi-hole, y
     # solo se cae al fichero (con -A3) si no hay CLI v6.
-    upstream_raw = run(SUDO + ["pihole-FTL", "--config", "dns.upstreams"])
-    if not upstream_raw:
-        try:
-            with open("/etc/pihole/pihole.toml", encoding="utf-8") as f:
-                upstream_raw = f.read()
-        except OSError:
-            upstream_raw = ""
-    upstream_ok = "127.0.0.1#{}".format(uport) in upstream_raw
+    # Cada motor apunta a Unbound con su propia sintaxis: Pi-hole usa
+    # 127.0.0.1#5335 y AdGuard 127.0.0.1:5335.
+    if engine() == "adguard":
+        upstream_ok = "127.0.0.1:{}".format(uport) in agh_block_values(
+            "dns", "upstream_dns")
+    else:
+        upstream_raw = run(SUDO + ["pihole-FTL", "--config", "dns.upstreams"])
+        if not upstream_raw:
+            try:
+                with open("/etc/pihole/pihole.toml", encoding="utf-8") as f:
+                    upstream_raw = f.read()
+            except OSError:
+                upstream_raw = ""
+        upstream_ok = "127.0.0.1#{}".format(uport) in upstream_raw
 
+    filtro = "AdGuard" if engine() == "adguard" else "Pi-hole"
     return {
-        "Puerto {} (Pi-hole)".format(pport): port_open(pport),
+        "Puerto {} ({})".format(pport, filtro): port_open(pport),
         "Puerto {} (Unbound)".format(uport): port_open(uport),
         "Unbound solo en localhost": localhost_only,
         "Upstream = Unbound": upstream_ok,
@@ -165,13 +289,14 @@ def verify():
 
 def restart():
     run(SUDO + ["systemctl", "restart", "unbound"])
-    run(SUDO + ["systemctl", "restart", "pihole-FTL"])
+    run(SUDO + ["systemctl", "restart", engine_svc()])
 
 # --- Recoleccion de datos ---
 def collect():
     return {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "pihole": service_active("pihole-FTL"),
+        "engine_label": engine_label(),
+        "pihole": service_active(engine_svc()),
         "unbound": service_active("unbound"),
         "dns_pihole": dig_test("127.0.0.1", pihole_port()),
         "dns_unbound": dig_test("127.0.0.1", unbound_port()),
@@ -256,7 +381,7 @@ def render_html(data):
         '</div>'
         '<header><h1>nexo-dns</h1><span class="badge">Actualizado: {}</span></header>'
         '<div class="grid">'
-        '  <div class="card"><div class="label">Pi-hole FTL</div><div class="value"><span class="dot {}"></span>{}</div></div>'
+        '  <div class="card"><div class="label">{}</div><div class="value"><span class="dot {}"></span>{}</div></div>'
         '  <div class="card"><div class="label">Unbound</div><div class="value"><span class="dot {}"></span>{}</div></div>'
         '  <div class="card"><div class="label">Dominios bloqueados</div><div class="value">{}</div></div>'
         '  <div class="card"><div class="label">Clientes (24 h)</div><div class="value"><span class="dot {}"></span>{}</div></div>'
@@ -273,6 +398,7 @@ def render_html(data):
         '</div></body></html>'
     ).format(
         CSS, data["timestamp"],
+        html_lib.escape(str(data.get("engine_label", "Pi-hole FTL"))),
         pihole_dot, pihole_status,
         unbound_dot, unbound_status,
         data["gravity"],

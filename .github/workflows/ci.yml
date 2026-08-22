@@ -23,8 +23,8 @@ jobs:
       - name: Probar portada sin root ni color
         run: |
           NO_COLOR=1 TERM=xterm NEXO_LOGO=mini bash nexo-dns.sh banner > /tmp/banner.txt
-          grep -q "nexo-dns v4.1" /tmp/banner.txt
-          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.1"
+          grep -q "nexo-dns v4.2" /tmp/banner.txt
+          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.2"
 
   python:
     name: Python ${{ matrix.python-version }}

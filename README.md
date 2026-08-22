@@ -6,10 +6,11 @@
 
 **DNS privado, filtrado y recursivo — en casa o en una VPS**
 
-Pi-hole + Unbound + Tailscale, en un solo script con panel de gestión.
+Pi-hole **o** AdGuard Home, + Unbound + Tailscale, en un solo script con panel de gestión.
 
 ![Bash](https://img.shields.io/badge/Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![Pi-hole](https://img.shields.io/badge/Pi--hole%20v6-F60?style=flat-square&logo=pihole&logoColor=white)
+![AdGuard Home](https://img.shields.io/badge/AdGuard%20Home-67B279?style=flat-square&logo=adguard&logoColor=white)
 ![Unbound](https://img.shields.io/badge/Unbound-2BC4DC?style=flat-square)
 ![Tailscale](https://img.shields.io/badge/Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
@@ -21,15 +22,31 @@ Pi-hole + Unbound + Tailscale, en un solo script con panel de gestión.
 
 ## Qué es
 
-Un servidor DNS para tu casa que **bloquea publicidad y rastreo** (Pi-hole) y que
+Un servidor DNS para tu casa que **bloquea publicidad y rastreo** y que
 **resuelve por su cuenta** preguntando a los servidores raíz (Unbound), en vez de
 delegar en Google o Cloudflare.
 
 La diferencia importa: con un DNS público, ese proveedor ve **todos** los dominios
 que visitas. Con un resolver recursivo propio, ningún actor tiene la foto completa.
 
+El filtro lo eliges tú al instalar: **Pi-hole** o **AdGuard Home**. Unbound va
+detrás de cualquiera de los dos y se configura con el mismo criterio en ambos.
+
 `nexo-dns.sh` lo instala, lo afina para tu hardware y te deja un panel para
 gestionarlo. Un solo fichero, sin dependencias más allá de lo que ya trae el sistema.
+
+### Pi-hole o AdGuard Home
+
+|  | Pi-hole | AdGuard Home |
+|---|---|---|
+| Listas | `gravity.db`, catálogos enormes | filtros propios, mismo formato |
+| Cifrado hacia el cliente | no lo trae | DoH, DoT y DoQ de serie |
+| Por dispositivo | reglas por cliente | perfiles y horarios por cliente |
+| Instalación | interactiva, en el sistema | binario Go en `/opt`, asistente web |
+| Peso en una Pi 3 | menor | 100-150 MB más |
+
+Los dos pueden estar instalados a la vez, pero **solo uno puede tener el puerto
+53**. La opción 17 del panel los alterna sin desinstalar nada.
 
 ## Instalación
 
@@ -37,6 +54,18 @@ gestionarlo. Un solo fichero, sin dependencias más allá de lo que ya trae el s
 curl -fsSLO https://raw.githubusercontent.com/Dark-admin/pihole-unbound-manager/main/nexo-dns.sh
 sudo bash nexo-dns.sh install
 ```
+
+Lo primero que pregunta es cuál de los dos filtros quieres:
+
+```
+  ¿Qué filtro quieres? Unbound va detrás de los dos por igual.
+    1) Pi-hole       — más listas, panel clásico, gravity
+    2) AdGuard Home  — DNS cifrado propio, reglas por cliente
+```
+
+> **AdGuard**: su asistente web pide crear usuario y contraseña. El script se
+> detiene ahí, te da la URL (`http://IP:3000`) y sigue con la optimización
+> cuando lo hayas terminado. Las credenciales las pones tú.
 
 Después, para todo lo demás:
 
@@ -59,7 +88,7 @@ sudo bash nexo-dns.sh
   │        *###*#**##***     +%%%%%%%%%+         │
   │          ********+          +%%%+            │
   │            +***+                             │
-  │                nexo-dns v4.1                 │
+  │                nexo-dns v4.2                 │
   │        Privado • filtrado • recursivo        │
   ├──────────────────────────────────────────────┤
   │ ● Pi-hole :53    ● Unbound :5335             │
@@ -92,10 +121,22 @@ sudo bash nexo-dns.sh
   │   [15] › Copias / restaurar                  │
   │   [16] › Instalar todo                       │
   ├──────────────────────────────────────────────┤
+  │ ◇ MOTOR ──────────────────────────────────── │
+  │   [17] › Cambiar a AdGuard                   │
+  │   [18] › Instalar AdGuard Home               │
+  ├──────────────────────────────────────────────┤
   │   [ 0] › Salir                               │
   │ Selecciona una opción y pulsa Enter          │
   ╰──────────────────────────────────────────────╯
 ```
+
+> Las opciones del motor van **al final a propósito**: así los números 1 al 16
+> no se mueven de donde ya estaban. La sección va en índigo porque ESTADO ya
+> usa verde y el de AdGuard no se distinguiría de él.
+>
+> La insignia, el color de la sección DNS y la flecha del prompt **siguen al
+> filtro activo**: coral con Pi-hole, verde con AdGuard. Se ve cuál manda sin
+> leer nada.
 
 > Arriba, la talla mediana en una ventana de 50 columnas. En el terminal va
 > coloreado: las hojas de Pi-hole en verde y la frambuesa en rojo, los brazos
@@ -132,7 +173,7 @@ servicio usan un punto semántico sin recolorear toda la línea. El banner, el
 nombre, la versión y el lema comparten la misma cabecera tanto en el panel como
 en `nexo-dns.sh banner`.
 
-Las opciones van numeradas **del 1 al 16 en el orden en que se leen**. Antes la
+Las opciones van numeradas **del 1 al 18 en el orden en que se leen**. Antes la
 16 salía entre la 9 y la 10 porque se añadió al final, y buscarla era un
 ejercicio de paciencia.
 
@@ -178,6 +219,7 @@ Sin abrir el panel, útiles para cron o scripts:
 | `sudo bash nexo-dns.sh optimize` | Reaplica la optimización de Unbound |
 | `sudo bash nexo-dns.sh security` | Qué tienes expuesto a internet |
 | `sudo bash nexo-dns.sh firewall` | Cierra el DNS y el panel al exterior |
+| `sudo bash nexo-dns.sh engine` | Cambia entre Pi-hole y AdGuard Home |
 | `bash nexo-dns.sh banner` | Portada; no necesita root |
 
 ## En una VPS
