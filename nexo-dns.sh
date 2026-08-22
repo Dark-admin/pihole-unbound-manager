@@ -1377,8 +1377,9 @@ switch_engine() {
     ok "Motor activo: $tgt_n"
     configure_engine || warn "Revisa la configuración: panel → Reoptimizar"
     if fw_active; then
-      warn "El cortafuegos lleva los puertos escritos dentro: vuelve a aplicarlo"
-      warn "desde panel → Seguridad para que cubra los de $tgt_n."
+      info "Regenerando el cortafuegos con los puertos de $tgt_n"
+      install_firewall_quiet && ok "Cortafuegos al día" \
+                             || warn "Revísalo: panel → Seguridad"
     fi
   else
     err "$tgt_n no resuelve en el puerto $PIHOLE_PORT; vuelvo a $cur_n"
@@ -1593,7 +1594,7 @@ change_unbound_port() {
   echo "  Actual: ${BLD}$UNBOUND_PORT${NC}   ·   Pi-hole usa el $PIHOLE_PORT"
   local np; np=$(ask "Nuevo puerto para Unbound:")
   valid_port "$np" || { err "Puerto inválido"; pause; return; }
-  [[ "$np" == "$PIHOLE_PORT" ]] && { err "Chocaría con Pi-hole (puerto $PIHOLE_PORT)"; pause; return; }
+  [[ "$np" == "$PIHOLE_PORT" ]] && { err "Chocaría con $(engine_name) (puerto $PIHOLE_PORT)"; pause; return; }
   if port_taken_by_other "$np" unbound; then
     err "El puerto $np ya lo usa otro proceso:"; ss -tulpn 2>/dev/null | grep ":$np " | sed 's/^/    /'
     pause; return
@@ -2418,6 +2419,40 @@ FW_UNIT=/etc/systemd/system/nexo-dns-firewall.service
 
 fw_active() { nft list table inet nexo_dns >/dev/null 2>&1; }
 
+# Qué puertos hay que cerrar al mundo. Con Pi-hole son siempre los mismos tres.
+# AdGuard puede levantar además DNS cifrado, y ahí está la trampa: cerrar solo
+# el 53 deja el MISMO resolver contestando por 853 o 443, con el panel diciendo
+# que está cerrado a internet.
+#
+# El 3000 solo se cierra si el asistente está a medias. Terminado, AdGuard mueve
+# el panel al puerto elegido —que ya es WEB_PORT— y el 3000 deja de escuchar:
+# cerrarlo siempre sería cerrar un puerto que no usa nadie.
+FW_TCP=""; FW_UDP=""; FW_EXTRA=""
+engine_fw_ports() {
+  FW_TCP="$PIHOLE_PORT, $UNBOUND_PORT, $WEB_PORT"
+  FW_UDP="$PIHOLE_PORT, $UNBOUND_PORT"
+  FW_EXTRA=""
+  [[ "$ENGINE" == adguard && -f "$AGH_YAML" ]] || return 0
+
+  local tcp="" udp="" v
+  (( AGH_READY )) || tcp="3000"
+  if [[ "$(agh_get tls enabled)" == "true" ]]; then
+    for v in port_https port_dns_over_tls; do
+      local p; p=$(agh_get tls "$v")
+      [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )) && tcp="${tcp:+$tcp, }$p"
+    done
+    local q; q=$(agh_get tls port_dns_over_quic)
+    [[ "$q" =~ ^[0-9]+$ ]] && (( q > 0 )) && udp="${udp:+$udp, }$q"
+    local dc; dc=$(agh_get tls port_dnscrypt)
+    if [[ "$dc" =~ ^[0-9]+$ ]] && (( dc > 0 )); then
+      tcp="${tcp:+$tcp, }$dc"; udp="${udp:+$udp, }$dc"
+    fi
+  fi
+  [[ -n "$tcp" ]] && { FW_TCP="$FW_TCP, $tcp"; FW_EXTRA="TCP $tcp"; }
+  [[ -n "$udp" ]] && { FW_UDP="$FW_UDP, $udp"; FW_EXTRA="${FW_EXTRA:+$FW_EXTRA · }UDP $udp"; }
+  return 0
+}
+
 # La IP pública se pregunta por DNS, no por HTTP: es una consulta normal a
 # OpenDNS, sin cabeceras ni cookies, y encaja con lo que ya hace esta máquina.
 public_ip() { dig +short +time=3 +tries=1 myip.opendns.com @resolver1.opendns.com 2>/dev/null | grep -v '^;;' | head -1; }
@@ -2502,8 +2537,13 @@ install_firewall() {
     yes_no "¿Lo instalo?" || { pause; return; }
     apt-get install -y nftables || { err "No se pudo instalar"; pause; return; }
   }
+  engine_fw_ports
   echo
   echo "  Se cierra el DNS ($PIHOLE_PORT) y el panel web ($WEB_PORT) a internet,"
+  if [[ -n "$FW_EXTRA" ]]; then
+    echo "  y además los puertos propios de AdGuard: ${BLD}${FW_EXTRA}${NC}"
+    echo "  ${DIM}Cerrar solo el 53 dejaría el mismo resolver accesible por ahí.${NC}"
+  fi
   echo "  dejándolos abiertos solo para:"
   echo "    · la propia máquina (loopback)"
   echo "    · redes privadas: 10/8, 172.16/12, 192.168/16"
@@ -2514,6 +2554,21 @@ install_firewall() {
   echo "  dejarte fuera de la máquina."
   echo
   yes_no "¿Aplicar?" || { pause; return; }
+  install_firewall_quiet
+  echo
+  warn "Esto es el cortafuegos DEL SISTEMA. Si tu proveedor tiene además"
+  warn "grupos de seguridad (AWS, Azure, GCP...), revísalos también: son"
+  warn "una segunda puerta, por delante de esta."
+  pause
+}
+
+# La generación de reglas, sin preguntas ni pausas. La usa el menú y también el
+# cambio de motor, que tiene que rehacerlas con los puertos del filtro nuevo:
+# el fichero .nft lleva los números escritos dentro, así que si no se regenera
+# se queda cerrando los del motor anterior.
+install_firewall_quiet() {
+  need nft || return 1
+  engine_fw_ports
 
   # `table` antes de `delete` crea la tabla si no existe: así el delete nunca
   # falla en la primera ejecución y el fichero es idempotente.
@@ -2535,9 +2590,8 @@ table inet nexo_dns {
         iif lo accept
         ip saddr @confiables accept
         ip6 saddr { fd00::/8, fe80::/10 } accept
-        udp dport { $PIHOLE_PORT, $UNBOUND_PORT } drop
-        tcp dport { $PIHOLE_PORT, $UNBOUND_PORT } drop
-        tcp dport $WEB_PORT drop
+        udp dport { $FW_UDP } drop
+        tcp dport { $FW_TCP } drop
     }
 }
 EOF
@@ -2545,10 +2599,10 @@ EOF
 
   if ! nft -c -f "$FW_NFT" 2>/dev/null; then
     err "Las reglas no son válidas:"; nft -c -f "$FW_NFT" 2>&1 | sed 's/^/    /'
-    rm -f "$FW_NFT"; pause; return 1
+    rm -f "$FW_NFT"; return 1
   fi
-  nft -f "$FW_NFT" || { err "No se pudieron cargar"; pause; return 1; }
-  ok "Reglas cargadas"
+  nft -f "$FW_NFT" || { err "No se pudieron cargar"; return 1; }
+  ok "Reglas cargadas · TCP {$FW_TCP} · UDP {$FW_UDP}"
 
   local nftbin; nftbin=$(command -v nft)
   cat > "$FW_UNIT" <<EOF
@@ -2573,17 +2627,14 @@ EOF
   sleep 1
   if dig +short +time=5 google.com @127.0.0.1 -p "$PIHOLE_PORT" >/dev/null 2>&1; then
     ok "El DNS sigue funcionando desde la máquina"
+    return 0
   else
     err "El DNS ha dejado de responder — quitando las reglas"
     nft delete table inet nexo_dns 2>/dev/null || true
     systemctl disable nexo-dns-firewall.service >/dev/null 2>&1 || true
     rm -f "$FW_NFT" "$FW_UNIT"; systemctl daemon-reload
+    return 1
   fi
-  echo
-  warn "Esto es el cortafuegos DEL SISTEMA. Si tu proveedor tiene además"
-  warn "grupos de seguridad (AWS, Azure, GCP...), revísalos también: son"
-  warn "una segunda puerta, por delante de esta."
-  pause
 }
 
 remove_firewall() {

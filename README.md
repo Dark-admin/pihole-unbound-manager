@@ -242,6 +242,19 @@ La opción **10** del panel:
 - Instala un cortafuegos con nftables que cierra el DNS y el panel web a
   internet, dejándolos abiertos para loopback, redes privadas y el tailnet
 
+**Con AdGuard cierra además sus puertos propios**, y no es un detalle: si
+activas DNS cifrado hay un resolver esperando en **853** (DoT), **443** (DoH),
+**784** (DoQ) y **5443** (DNSCrypt). Cerrar solo el 53 dejaría el mismo servidor
+accesible por otra puerta, con el panel diciendo que está cerrado a internet.
+
+Los puertos se leen del bloque `tls:` de tu YAML, así que **solo se cierran los
+que tengas levantados de verdad**. El 3000 del asistente se cierra únicamente si
+está a medias: al terminarlo AdGuard mueve el panel al puerto elegido y el 3000
+deja de escuchar.
+
+Al cambiar de motor las reglas **se regeneran solas**: el fichero `.nft` lleva
+los números escritos dentro y si no, se quedaría cerrando los del anterior.
+
 El cortafuegos **no puede dejarte fuera de la máquina**: la política de la
 cadena es `accept` y solo se descartan los puertos del DNS y del panel. El SSH
 no se toca. Después de cargarlo comprueba que la resolución sigue funcionando
