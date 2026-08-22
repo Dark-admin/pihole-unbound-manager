@@ -3,7 +3,7 @@
 #  nexo-dns.sh — Instalador y panel de DNS privado
 #  Pi-hole + Unbound + Tailscale
 #
-#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.0
+#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.1
 #  Compatible: Raspberry Pi OS · Debian 11+ · Ubuntu 20.04+ · VPS
 #
 #  Uso:
@@ -33,7 +33,7 @@ fi
 
 # OJO: no llamarla VERSION. /etc/os-release define VERSION y al leerlo
 # machacaría la nuestra ("nexo-dns v13 (trixie)").
-NEXO_VERSION="4.0"
+NEXO_VERSION="4.1"
 CONF=/etc/nexo-dns.conf
 UNBOUND_CONF=/etc/unbound/unbound.conf.d/pi-hole.conf
 PIHOLE_TOML=/etc/pihole/pihole.toml
@@ -41,9 +41,9 @@ FTL_DB=/etc/pihole/pihole-FTL.db
 BACKUP_ROOT=/var/backups/nexo-dns
 
 # ══════════════════════════════════════════════════════════ presentación ═══════
-# Paleta de marca. Son los colores reales de cada proyecto, no aproximaciones:
-#   Pi-hole   #F60D1A rojo · #96060C granate  (logo y panel web de Pi-hole)
-#   Unbound   #3B82F6 azul · #22D3EE cian     (NLnet Labs)
+# Paleta inspirada en ambas marcas y equilibrada para fondo oscuro:
+#   Pi-hole   coral + granate + verde de las hojas
+#   Unbound   cian + índigo
 # Se usa la mayor profundidad de color que soporte el terminal y se degrada
 # hasta ANSI de 8 colores sin perder legibilidad. NO_COLOR=1 lo desactiva todo.
 COLOR_DEPTH=0
@@ -82,18 +82,19 @@ if (( COLOR_DEPTH )); then
   # Tomada de los dos logotipos. El panel NO usa el color por defecto del
   # terminal: si lo hiciera, heredaria el verde, el ambar o lo que tenga el
   # tema de cada uno y no habria tematica que valga. Aqui todo va explicito.
-  PH=$(fg  240  57  43 203 '1;31')   # Pi-hole  rojo    #F0392B
-  PHD=$(fg 170  34  20 124 '0;31')   # Pi-hole  granate
-  PHG=$(fg  34 200  30  40 '1;32')   # Pi-hole  hoja    #22C81E
-  UB=$(fg   43 196 220  44 '1;36')   # Unbound  cian    #2BC4DC
-  UBN=$(fg  92  92 205  62 '1;34')   # Unbound  galon
-  UBC=$(fg  34 211 238  45 '0;36')
-  TS=$(fg  150 150 150 245 '0;37')   # Tailscale, gris de su marca
+  PH=$(fg  244  63  94 204 '1;31')   # Pi-hole  rojo coral #F43F5E
+  PHD=$(fg 190  24  93 161 '0;31')   # Pi-hole  granate   #BE185D
+  PHG=$(fg  74 222 128  84 '1;32')   # Pi-hole  hoja      #4ADE80
+  UB=$(fg   34 211 238  45 '1;36')   # Unbound  cian      #22D3EE
+  UBN=$(fg  99 102 241  63 '1;34')   # Unbound  índigo    #6366F1
+  UBC=$(fg 103 232 249  87 '0;36')   # Unbound  cian claro
+  TS=$(fg  203 213 225 252 '0;37')   # Tailscale, gris frío
   # ── Interfaz ─────────────────────────────────────────────────────────
-  TXT=$(fg 226 224 218 254 '0;37')   # texto normal, hueso sobre negro
-  MUT=$(fg 122 130 144 245 '1;30')   # secundario: valores, notas
-  LIN=$(fg  72  84 102 240 '1;30')   # bordes del cuadro
-  NUM=$(fg 255 255 255 231 '1;37')   # los numeros del menu, lo que se teclea
+  TXT=$(fg 241 245 249 255 '0;37')   # texto principal, blanco frío
+  MUT=$(fg 148 163 184 246 '0;37')   # texto secundario y valores
+  LIN=$(fg  71  85 105 240 '1;30')   # bordes pizarra
+  NUM=$(fg 255 255 255 231 '1;37')   # números: máxima legibilidad
+  VAL=$(fg 165 243 252 159 '0;36')   # valores configurados
   # ── Estado ───────────────────────────────────────────────────────────
   GRN=$(fg  34 197  94  77 '0;32')   # bien
   YEL=$(fg 250 204  21 220 '1;33')   # ojo
@@ -102,7 +103,7 @@ if (( COLOR_DEPTH )); then
   DIM=$'\033[2m'; BLD=$'\033[1m'; NC=$'\033[0m'
 else
   PH=''; PHD=''; PHG=''; UB=''; UBN=''; UBC=''; TS=''
-  TXT=''; MUT=''; LIN=''; NUM=''
+  TXT=''; MUT=''; LIN=''; NUM=''; VAL=''
   GRN=''; YEL=''; RED=''; BLU=''
   RED=''; GRN=''; YEL=''; BLU=''; DIM=''; BLD=''; NC=''
 fi
@@ -114,12 +115,14 @@ fi
 # solo las variables se elegían bordes Unicode con LC_ALL=C y se descuadraba.
 if [[ "$(locale charmap 2>/dev/null)" == "UTF-8" ]]; then
   UTF8_OK=1
-  TL='╔'; TR='╗'; BL='╚'; BR='╝'; HZ='═'; VT='║'; LT='╠'; RT='╣'
-  I_EST='◆'; I_CFG='▣'; I_TS='▲'; I_SYS='■'; I_SEC='▼'; DOT='●'
+  TL='╭'; TR='╮'; BL='╰'; BR='╯'; HZ='─'; VT='│'; LT='├'; RT='┤'
+  SHZ='─'; ARROW='›'; BULLET='•'; DOT='●'; DOT_OFF='○'
+  I_EST='◆'; I_CFG='◇'; I_TS='▲'; I_SYS='■'; I_SEC='▼'
 else
   UTF8_OK=0
   TL='+'; TR='+'; BL='+'; BR='+'; HZ='-'; VT='|'; LT='+'; RT='+'
-  I_EST='*'; I_CFG='#'; I_TS='^'; I_SYS='='; I_SEC='!'; DOT='o'
+  SHZ='-'; ARROW='>'; BULLET='-'; DOT='o'; DOT_OFF='-'
+  I_EST='*'; I_CFG='o'; I_TS='^'; I_SYS='#'; I_SEC='!'
 fi
 
 BOXW=64   # ancho interior del cuadro (se recalcula segun la ventana)
@@ -360,6 +363,11 @@ hline()  { printf '%s' "$HLINE"; }
 btop()   { printf '  %s%s%s%s%s\n' "$LIN" "$TL" "$(hline)" "$TR" "$NC"; }
 bsep()   { printf '  %s%s%s%s%s\n' "$LIN" "$LT" "$(hline)" "$RT" "$NC"; }
 bbot()   { printf '  %s%s%s%s%s\n' "$LIN" "$BL" "$(hline)" "$BR" "$NC"; }
+repeat_char() {  # $1 carácter · $2 cantidad
+  local out='' i
+  for (( i=0; i<$2; i++ )); do out+="$1"; done
+  printf '%s' "$out"
+}
 # Si el contenido excede el ancho, el relleno saldría negativo y printf fallaría
 # rompiendo el cuadro. Con nombres de host o de distro largos pasa de verdad,
 # así que se recorta y se marca con '…'.
@@ -390,13 +398,19 @@ pad_to() {
 # Enseñar el valor ahí ahorra entrar solo para mirarlo.
 mi() {   # $1 número · $2 etiqueta · $3 valor (opcional)
   local s
-  printf -v s '%s%2s%s %s%s%s' "$NUM" "$1" "$NC" "$TXT" "$2" "$NC"
-  [[ -n "${3:-}" ]] && s+=" ${MUT}${3}${NC}"
+  printf -v s '%s[%2s]%s %s%s%s %s%s%s' \
+    "$NUM" "$1" "$NC" "$LIN" "$ARROW" "$NC" "$TXT" "$2" "$NC"
+  [[ -n "${3:-}" ]] && s+=" ${VAL}${3}${NC}"
   printf '%s' "$s"
 }
-# Cabecera de sección: icono en el color de la marca que la manda.
+# Cabecera de sección: título corto y una guía fina hasta el borde. La línea
+# mantiene la estructura visible sin llenar el panel de cajas y colores.
 sec() {  # $1 icono · $2 color · $3 título
-  brow "${2}${1}${NC}  ${BLD}${2}${3}${NC}"
+  local label fill n
+  label="${2}${1}${NC} ${BLD}${2}${3}${NC}"
+  n=$(( BOXW - $(vislen "$label") - 2 )); (( n < 0 )) && n=0
+  fill=$(repeat_char "$SHZ" "$n")
+  brow "$label ${LIN}$fill${NC}"
 }
 # Pinta los elementos de un menú en una o dos columnas según quepa.
 menu_items() {
@@ -423,13 +437,43 @@ bcenter() {
   brow "$(printf '%*s%s' "$pad" '' "$t")"
 }
 banner_rows() { printf '%s\n' "${BANNER_ROWS[@]}"; }
+# Cabecera compartida por el panel y la portada. Así el banner no es un adorno
+# separado: logos, nombre, versión y lema forman una sola identidad visual.
+draw_brand_header() {
+  local r
+  case "$LAYOUT" in
+    grande|mini)
+      build_banner "$LAYOUT"
+      while IFS= read -r r; do bcenter "$r"; done < <(banner_rows) ;;
+    *)
+      brow ''
+      bcenter "${PH}${BLD}Pi-hole${NC} ${LIN}${BULLET}${NC} ${UB}${BLD}Unbound${NC} ${LIN}${BULLET}${NC} ${TS}Tailscale${NC}" ;;
+  esac
+  bcenter "${BLD}${TXT}nexo-dns${NC} ${MUT}v$NEXO_VERSION${NC}"
+  bcenter "${MUT}Privado ${LIN}${BULLET}${NC} ${MUT}filtrado ${LIN}${BULLET}${NC} ${MUT}recursivo${NC}"
+  [[ "$LAYOUT" == texto ]] && brow ''
+}
+
 # Portada a pantalla completa: se usa al instalar y con `nexo-dns.sh banner`.
 splash() {
-  local r
+  elegir_layout
   echo
-  while IFS= read -r r; do printf '%s\n' "$r"; done < <(banner_rows)
+  btop
+  draw_brand_header
+  bbot
   echo
-  printf '   %s\n\n' "${DIM}DNS privado, filtrado y recursivo${NC}"
+}
+
+# Una insignia compacta de servicio: semántica en el punto y marca en el nombre.
+service_badge() {  # $1 estado on|off|na · $2 color · $3 nombre · $4 valor
+  local mark state_col
+  case "$1" in
+    on)  mark="$DOT";     state_col="$GRN" ;;
+    off) mark="$DOT";     state_col="$RED" ;;
+    *)   mark="$DOT_OFF"; state_col="$MUT" ;;
+  esac
+  printf '%s%s%s %s%s%s%s' "$state_col" "$mark" "$NC" \
+    "$2" "$3" "$NC" "${4:+ ${VAL}$4${NC}}"
 }
 
 info() { echo "${BLU}[i]${NC} $*"; }
@@ -444,8 +488,27 @@ yes_no(){ local r; r=$(ask "$1 [s/N]"); [[ "$r" =~ ^[sSyY]$ ]]; }
 clear_screen() { clear 2>/dev/null || printf '\033[2J\033[H'; }
 
 # ══════════════════════════════════════════════════════════ requisitos ═════════
-[[ $EUID -eq 0 ]] || { err "Hace falta root. Ejecuta: sudo bash $0 ${*:-}"; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1; }
+require_root() {
+  [[ $EUID -eq 0 ]] || {
+    err "Hace falta root. Ejecuta: sudo bash $0 ${*:-}"
+    exit 1
+  }
+}
+
+# Evita dos instalaciones o dos paneles modificando los mismos ficheros a la
+# vez. `status`, `health` y `security` siguen disponibles mientras tanto.
+acquire_lock() {
+  need flock || return 0
+  exec 9>/run/lock/nexo-dns.lock || {
+    err "No se pudo crear el bloqueo de ejecución"
+    exit 1
+  }
+  if ! flock -n 9; then
+    err "Ya hay otra instancia de nexo-dns realizando cambios"
+    exit 1
+  fi
+}
 
 # `dig +short` escribe ";; communications error ..." por STDOUT (BIND 9.20), no
 # por stderr, así que 2>/dev/null no basta: hay que descartar las líneas ';;'.
@@ -586,8 +649,20 @@ ph_set() {
 LISTEN_IP=""; PIHOLE_PORT=53; UNBOUND_PORT=5335; WEB_PORT=80
 
 load_conf() {
-  # shellcheck disable=SC1090
-  [[ -f "$CONF" ]] && source "$CONF"
+  # Solo se aceptan las cuatro claves que escribe save_conf. Antes se hacía
+  # `source` del fichero completo: un contenido manipulado se ejecutaría como
+  # root al abrir el panel.
+  if [[ -f "$CONF" ]]; then
+    local key value
+    while IFS='=' read -r key value; do
+      case "$key" in
+        LISTEN_IP)    valid_ip "$value"   && LISTEN_IP="$value" ;;
+        PIHOLE_PORT)  valid_port "$value" && PIHOLE_PORT="$value" ;;
+        UNBOUND_PORT) valid_port "$value" && UNBOUND_PORT="$value" ;;
+        WEB_PORT)     valid_port "$value" && WEB_PORT="$value" ;;
+      esac
+    done < "$CONF"
+  fi
   [[ -z "$LISTEN_IP" ]] && LISTEN_IP=$(ip -4 -br addr show scope global 2>/dev/null | awk 'NR==1{sub(/\/.*/,"",$3); print $3}')
   if [[ -f "$UNBOUND_CONF" ]]; then
     local p; p=$(grep -oP '^\s*port:\s*\K[0-9]+' "$UNBOUND_CONF" 2>/dev/null | head -1)
@@ -615,10 +690,11 @@ EOF
 backup_now() {
   local d
   d="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$d"
+  install -d -m 700 "$BACKUP_ROOT" "$d"
   [[ -f "$UNBOUND_CONF" ]] && cp -a "$UNBOUND_CONF" "$d/"
   [[ -f "$PIHOLE_TOML"  ]] && cp -a "$PIHOLE_TOML"  "$d/"
   [[ -f "$CONF"         ]] && cp -a "$CONF"         "$d/"
+  chmod -R go-rwx "$d"
   echo "$d"
 }
 
@@ -659,7 +735,8 @@ find_root_hints() {
     [[ -s "$f" ]] && { echo "$f"; return; }
   done
   mkdir -p /var/lib/unbound
-  if curl -fsSL --retry 3 -o /var/lib/unbound/root.hints.new https://www.internic.net/domain/named.root 2>/dev/null \
+  if curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+     -o /var/lib/unbound/root.hints.new https://www.internic.net/domain/named.root 2>/dev/null \
      && grep -q 'A.ROOT-SERVERS.NET' /var/lib/unbound/root.hints.new; then
     mv /var/lib/unbound/root.hints.new /var/lib/unbound/root.hints
     chown unbound:unbound /var/lib/unbound/root.hints 2>/dev/null || true
@@ -815,9 +892,22 @@ prune_unsupported() {
 
 restore_unbound() {
   local d="$1"
-  [[ -f "$d/pi-hole.conf" ]] && cp -a "$d/pi-hole.conf" "$UNBOUND_CONF"
+  if [[ -f "$d/pi-hole.conf" ]]; then
+    cp -a "$d/pi-hole.conf" "$UNBOUND_CONF"
+  else
+    # En una instalación nueva no había configuración anterior. Dejar el
+    # fichero recién generado después de fallar no sería una reversión real.
+    rm -f "$UNBOUND_CONF"
+  fi
   systemctl restart unbound 2>/dev/null || true
   warn "Revertido desde $d"
+}
+
+restore_pihole() {
+  local d="$1"
+  [[ -f "$d/pihole.toml" ]] || return 0
+  cp -a "$d/pihole.toml" "$PIHOLE_TOML"
+  systemctl restart pihole-FTL 2>/dev/null || true
 }
 
 apply_unbound() {
@@ -833,13 +923,15 @@ apply_unbound() {
     || { err "Unbound no resuelve en el puerto $UNBOUND_PORT"; restore_unbound "$bkdir"; return 1; }
 
   local ad bad
-  ad=$(dig +dnssec cloudflare.com @127.0.0.1 -p "$UNBOUND_PORT" +time=5 2>/dev/null | grep -c ' ad;')
-  bad=$(dig dnssec-failed.org @127.0.0.1 -p "$UNBOUND_PORT" +time=5 2>/dev/null | grep -c 'status: SERVFAIL')
+  ad=$(dig +dnssec cloudflare.com @127.0.0.1 -p "$UNBOUND_PORT" +time=5 +tries=2 2>/dev/null | grep -c ' ad;')
+  bad=$(dig dnssec-failed.org @127.0.0.1 -p "$UNBOUND_PORT" +time=5 +tries=2 2>/dev/null | grep -c 'status: SERVFAIL')
   if [[ "$ad" == "1" && "$bad" == "1" ]]; then
     ok "DNSSEC valida (firma buena → ad, firma rota → SERVFAIL)"
   else
-    warn "DNSSEC no valida como debería (ad=$ad servfail=$bad)"
-    warn "Revisa el trust anchor: /var/lib/unbound/root.key"
+    err "DNSSEC no valida como debería (ad=$ad servfail=$bad)"
+    err "Se revierte para no dejar activo un resolver sin validación comprobada"
+    restore_unbound "$bkdir"
+    return 1
   fi
   ok "Unbound activo en 127.0.0.1#$UNBOUND_PORT"
 }
@@ -852,13 +944,25 @@ configure_pihole() {
     warn "En el panel web pon como DNS upstream:  127.0.0.1#$UNBOUND_PORT"
     return 1
   fi
-  ph_set dns.upstreams "[ \"127.0.0.1#$UNBOUND_PORT\" ]"
-  ph_set dns.dnssec false        # Unbound ya valida; hacerlo dos veces gasta CPU
-  ph_set dns.domainNeeded true   # no mandar fuera nombres sin dominio
-  ph_set dns.bogusPriv true      # ni PTR de rangos privados
-  ph_set dns.EDNS0ECS false      # ECS filtraría tu subred a los autoritativos
-  systemctl restart pihole-FTL 2>/dev/null || true
+  local failed=0
+  ph_set dns.upstreams "[ \"127.0.0.1#$UNBOUND_PORT\" ]" || failed=1
+  ph_set dns.dnssec false        || failed=1  # Unbound ya valida
+  ph_set dns.domainNeeded true   || failed=1  # no mandar fuera nombres sin dominio
+  ph_set dns.bogusPriv true      || failed=1  # ni PTR de rangos privados
+  ph_set dns.EDNS0ECS false      || failed=1  # no filtrar la subred con ECS
+  if (( failed )); then
+    err "No se pudieron aplicar todos los ajustes de Pi-hole"
+    return 1
+  fi
+  systemctl restart pihole-FTL 2>/dev/null || {
+    err "Pi-hole no se pudo reiniciar"
+    return 1
+  }
   sleep 2
+  systemctl is-active --quiet pihole-FTL || {
+    err "Pi-hole no quedó activo después de configurarlo"
+    return 1
+  }
 }
 
 apply_sysctl_dns() {
@@ -915,9 +1019,28 @@ do_install() {
     ok "Pi-hole ya está instalado, no lo toco"
   else
     warn "El instalador de Pi-hole es interactivo y pide su propia configuración."
-    warn "Se lanza tal cual; cuando termine, este script sigue."
+    warn "Se descargará primero, se validará como Bash y se mostrará su hash."
     pause
-    curl -sSL https://install.pi-hole.net | bash || { err "Falló la instalación de Pi-hole"; pause; return 1; }
+    local installer installer_hash
+    installer=$(mktemp) || { err "No se pudo crear un fichero temporal"; pause; return 1; }
+    if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+         --connect-timeout 10 --max-time 120 \
+         -o "$installer" https://install.pi-hole.net; then
+      rm -f "$installer"
+      err "No se pudo descargar el instalador de Pi-hole"; pause; return 1
+    fi
+    if ! bash -n "$installer" || ! grep -qi 'pi-hole' "$installer"; then
+      rm -f "$installer"
+      err "El fichero descargado no parece un instalador válido de Pi-hole"
+      pause; return 1
+    fi
+    installer_hash=$(sha256sum "$installer" | awk '{print $1}')
+    info "SHA-256 del instalador descargado: $installer_hash"
+    if ! bash "$installer"; then
+      rm -f "$installer"
+      err "Falló la instalación de Pi-hole"; pause; return 1
+    fi
+    rm -f "$installer"
   fi
   detect_pihole
 
@@ -930,7 +1053,13 @@ do_install() {
   apply_unbound "$bk" || { pause; return 1; }
 
   step "6/6 · Enlazar Pi-hole con Unbound"
-  configure_pihole
+  if ! configure_pihole; then
+    err "La configuración no quedó completa; restaurando la copia anterior"
+    restore_pihole "$bk"
+    restore_unbound "$bk"
+    pause
+    return 1
+  fi
   save_conf
   echo
   ok "Instalación terminada"
@@ -985,14 +1114,19 @@ change_unbound_port() {
       warn "Pi-hole no está instalado: cuando lo instales, apunta su upstream"
       warn "a 127.0.0.1#$np"
     else
-      ph_set dns.upstreams "[ \"127.0.0.1#$np\" ]"
-      systemctl restart pihole-FTL 2>/dev/null || true; sleep 2
+      if ph_set dns.upstreams "[ \"127.0.0.1#$np\" ]" \
+         && systemctl restart pihole-FTL 2>/dev/null; then
+        sleep 2
+      else
+        err "No se pudo reapuntar Pi-hole; revirtiendo"
+        UNBOUND_PORT="$old"; restore_pihole "$bk"; restore_unbound "$bk"
+        pause; return
+      fi
       if dig +short +time=5 google.com @127.0.0.1 -p "$PIHOLE_PORT" >/dev/null 2>&1; then
         save_conf; ok "Unbound movido del $old al $np y Pi-hole apuntando ahí"
       else
         err "Pi-hole dejó de resolver; revirtiendo"
-        UNBOUND_PORT="$old"; restore_unbound "$bk"
-        ph_set dns.upstreams "[ \"127.0.0.1#$old\" ]"; systemctl restart pihole-FTL
+        UNBOUND_PORT="$old"; restore_pihole "$bk"; restore_unbound "$bk"
       fi
     fi
   else
@@ -1583,7 +1717,15 @@ do_optimize() {
   local bk; bk=$(backup_now); info "Copia en $bk"
   apply_sysctl_dns
   write_unbound_conf
-  apply_unbound "$bk" && configure_pihole && { save_conf; ok "Optimización aplicada"; }
+  if apply_unbound "$bk"; then
+    if configure_pihole; then
+      save_conf; ok "Optimización aplicada"
+    else
+      err "No se pudo configurar Pi-hole; restaurando la copia anterior"
+      restore_pihole "$bk"
+      restore_unbound "$bk"
+    fi
+  fi
   pause
 }
 
@@ -1806,38 +1948,33 @@ panel() {
     load_conf; detect_os; detect_platform
     elegir_layout
     clear_screen
-    local up ph ts r
-    systemctl is-active --quiet unbound 2>/dev/null    && up="${GRN}${DOT}${NC}" || up="${RED}${DOT}${NC}"
-    systemctl is-active --quiet pihole-FTL 2>/dev/null && ph="${GRN}${DOT}${NC}" || ph="${RED}${DOT}${NC}"
-    if   systemctl is-active --quiet tailscaled 2>/dev/null; then ts="${GRN}${DOT}${NC}"
-    elif need tailscale;                                     then ts="${RED}${DOT}${NC}"
-    else                                                          ts="${MUT}${DOT}${NC}"; fi
+    local up_state ph_state ts_state
+    systemctl is-active --quiet unbound 2>/dev/null    && up_state=on || up_state=off
+    systemctl is-active --quiet pihole-FTL 2>/dev/null && ph_state=on || ph_state=off
+    if   systemctl is-active --quiet tailscaled 2>/dev/null; then ts_state=on
+    elif need tailscale;                                     then ts_state=off
+    else                                                          ts_state=na; fi
 
     echo
     btop
-    case "$LAYOUT" in
-      grande|mini)
-        build_banner "$LAYOUT"
-        while IFS= read -r r; do bcenter "$r"; done < <(banner_rows)
-        bcenter "${BLD}${TXT}nexo-dns${NC} ${MUT}v$NEXO_VERSION${NC}" ;;
-      *)
-        brow ''
-        bcenter "${BLD}${TXT}nexo-dns${NC} ${MUT}v$NEXO_VERSION${NC}"
-        bcenter "${PH}Pi-hole${NC} ${MUT}·${NC} ${UB}Unbound${NC} ${MUT}·${NC} ${TS}Tailscale${NC}"
-        brow '' ;;
-    esac
+    draw_brand_header
     bsep
-    brow "$ph ${TXT}Pi-hole${NC} ${MUT}:$PIHOLE_PORT${NC}   $up ${TXT}Unbound${NC} ${MUT}:$UNBOUND_PORT${NC}   $ts ${TXT}Tailscale${NC}"
-    brow "${MUT}$(hostname) · $LISTEN_IP${NC}"
+    if (( BOXW >= 50 )); then
+      brow "$(service_badge "$ph_state" "$PH" Pi-hole ":$PIHOLE_PORT")   $(service_badge "$up_state" "$UB" Unbound ":$UNBOUND_PORT")   $(service_badge "$ts_state" "$TS" Tailscale '')"
+    else
+      brow "$(service_badge "$ph_state" "$PH" Pi-hole ":$PIHOLE_PORT")  $(service_badge "$up_state" "$UB" Unbound ":$UNBOUND_PORT")"
+      brow "$(service_badge "$ts_state" "$TS" Tailscale '')"
+    fi
+    brow "${MUT}HOST${NC}  ${TXT}$(hostname)${NC} ${LIN}${BULLET}${NC} ${VAL}$LISTEN_IP${NC} ${LIN}${BULLET}${NC} ${MUT}$PLATFORM${NC}"
     if (( IS_VPS )); then
       if fw_active; then
-        brow "${GRN}${DOT}${NC} ${MUT}$PLATFORM · DNS cerrado a internet${NC}"
+        brow "${MUT}SEGURIDAD${NC}  ${GRN}${DOT} PROTEGIDO${NC} ${LIN}${BULLET}${NC} ${MUT}DNS cerrado a internet${NC}"
       else
-        brow "${YEL}${I_SEC}${NC} ${YEL}$PLATFORM · DNS abierto a internet${NC}"
+        brow "${MUT}SEGURIDAD${NC}  ${YEL}${I_SEC} ATENCIÓN${NC} ${LIN}${BULLET}${NC} ${YEL}DNS abierto a internet${NC}"
       fi
     fi
     bsep
-    sec "$I_EST" "$PH" "ESTADO"
+    sec "$I_EST" "$GRN" "ESTADO"
     menu_items "$(mi 1 'Ver estado')" "$(mi 2 'Chequeo real')"
     bsep
     sec "$I_CFG" "$PH" "DNS"
@@ -1849,7 +1986,7 @@ panel() {
                "$(mi 8 'Listas de bloqueo')" \
                "$(mi 9 'Precalentar caché')"
     bsep
-    sec "$I_SEC" "$UB" "SEGURIDAD"
+    sec "$I_SEC" "$YEL" "SEGURIDAD"
     menu_items "$(mi 10 'Exposición y cortafuegos')"
     bsep
     sec "$I_TS" "$TS" "TAILSCALE"
@@ -1859,10 +1996,11 @@ panel() {
     menu_items "$(mi 13 'Red / BBR')" "$(mi 14 'Reiniciar servicios')" \
                "$(mi 15 'Copias / restaurar')" "$(mi 16 'Instalar todo')"
     bsep
-    brow "$(mi 0 'Salir')"
+    menu_items "$(mi 0 'Salir')"
+    brow "${MUT}Selecciona una opción y pulsa Enter${NC}"
     bbot
     echo
-    local c; c=$(ask "${PH}▶${NC} ${TXT}Opción${NC} ${MUT}[0-16]${NC}")
+    local c; c=$(ask "${PH}${ARROW}${NC} ${TXT}Opción${NC} ${UB}[0-16]${NC}")
     case "$c" in
       1)  show_status ;;
       2)  health_check ;;
@@ -1891,19 +2029,29 @@ panel() {
 }
 
 # ═══════════════════════════════════════════════════════════════ MAIN ═════════
+COMMAND="${1:-panel}"
+case "$COMMAND" in
+  -v|--version) echo "nexo-dns $NEXO_VERSION"; exit 0 ;;
+  -h|--help)    sed -n '2,24p' "$0"; exit 0 ;;
+  banner)       splash; exit 0 ;;
+  install|status|health|optimize|security|firewall|panel) ;;
+  *) err "Orden desconocida: $COMMAND"; sed -n '2,24p' "$0"; exit 1 ;;
+esac
+
+require_root "$COMMAND"
+case "$COMMAND" in
+  install|optimize|firewall|panel) acquire_lock ;;
+esac
 detect_os
 detect_platform
 load_conf
-case "${1:-panel}" in
-  install)   do_install ;;
-  status)    show_status ;;
-  health)    health_check ;;
-  optimize)  do_optimize ;;
-  security)  show_exposure ;;
-  firewall)  install_firewall ;;
-  banner)    splash ;;
-  panel|"")  panel ;;
-  -v|--version) echo "nexo-dns $NEXO_VERSION" ;;
-  -h|--help) sed -n '2,24p' "$0" ;;
-  *) err "Orden desconocida: $1"; sed -n '2,24p' "$0"; exit 1 ;;
+
+case "$COMMAND" in
+  install)  do_install ;;
+  status)   show_status ;;
+  health)   health_check ;;
+  optimize) do_optimize ;;
+  security) show_exposure ;;
+  firewall) install_firewall ;;
+  panel)    panel ;;
 esac

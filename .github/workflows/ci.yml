@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bash:
+    name: Bash
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Validar sintaxis
+        run: bash -n nexo-dns.sh
+      - name: Ejecutar ShellCheck
+        run: shellcheck -S warning nexo-dns.sh
+      - name: Probar portada sin root ni color
+        run: |
+          NO_COLOR=1 TERM=xterm NEXO_LOGO=mini bash nexo-dns.sh banner > /tmp/banner.txt
+          grep -q "nexo-dns v4.1" /tmp/banner.txt
+          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.1"
+
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compilar
+        run: python -m py_compile dashboard.py
+      - name: Ejecutar pruebas
+        run: python -m unittest discover -s tests -v

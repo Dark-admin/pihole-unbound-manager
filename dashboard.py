@@ -2,14 +2,12 @@
 """
 dashboard.py - Panel web para Pi-hole + Unbound
 Autor: nexo (Dark)
-v3.0 - Alineado con nexo-dns.sh: lee el puerto real de Unbound y verifica
-       cosas que significan algo (antes comprobaba un "fix" que ya no existe).
+v4.1 - Alineado con nexo-dns.sh y endurecido para uso en red.
 
 Uso:
     sudo python3 dashboard.py [--port 8080] [--host 0.0.0.0] [--auth usuario:password]
 """
 import http.server
-import socketserver
 import subprocess
 import re
 import os
@@ -17,23 +15,31 @@ import sys
 import argparse
 import base64
 import hmac
+import html as html_lib
+import ipaddress
+import secrets
+import urllib.parse
 from datetime import datetime
 
 # --- Utilidades de sistema ---
-SUDO = "" if os.geteuid() == 0 else "sudo "
+SUDO = [] if getattr(os, "geteuid", lambda: 1)() == 0 else ["sudo", "-n"]
 
 NEXO_CONF = "/etc/nexo-dns.conf"
 UNBOUND_CONF = "/etc/unbound/unbound.conf.d/pi-hole.conf"
 
 def run(cmd):
+    """Ejecuta una orden sin pasarla por un intérprete de shell."""
     try:
-        out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        out = subprocess.run(
+            cmd, shell=False, capture_output=True, text=True, timeout=10,
+            check=False,
+        )
         return out.stdout.strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return ""
 
 def service_active(name):
-    return run("{}systemctl is-active {}".format(SUDO, name)).strip() == "active"
+    return run(SUDO + ["systemctl", "is-active", name]).strip() == "active"
 
 def unbound_port():
     """Puerto de Unbound. Lo escribe nexo-dns.sh; si no esta, se lee de la
@@ -47,7 +53,12 @@ def unbound_port():
                         return p
     except Exception:
         pass
-    m = re.search(r'^\s*port:\s*(\d+)', run("cat {} 2>/dev/null".format(UNBOUND_CONF)), re.M)
+    try:
+        with open(UNBOUND_CONF, encoding="utf-8") as f:
+            config = f.read()
+    except OSError:
+        config = ""
+    m = re.search(r'^\s*port:\s*(\d+)', config, re.M)
     return m.group(1) if m else "5335"
 
 def pihole_port():
@@ -63,23 +74,28 @@ def pihole_port():
     return "53"
 
 def dig_test(server, port=""):
-    p = "-p {}".format(port) if port else ""
-    out = run("dig +short +time=2 google.com @{} {} 2>/dev/null | head -1".format(server, p))
+    cmd = ["dig", "+short", "+time=2", "google.com", "@{}".format(server)]
+    if port:
+        cmd.extend(["-p", str(port)])
+    out = run(cmd).splitlines()
+    out = out[0] if out else ""
     # dig +short escribe ";; communications error" por stdout, no por stderr
     if out and not out.startswith(";;") and "." in out:
         return out
     return ""
 
 def count_gravity():
-    try:
-        return run('{}pihole-FTL sqlite3 /etc/pihole/gravity.db "SELECT COUNT(*) FROM gravity;"'.format(SUDO)).strip() or "0"
-    except Exception:
-        return "0"
+    return run(SUDO + [
+        "pihole-FTL", "sqlite3", "/etc/pihole/gravity.db",
+        "SELECT COUNT(*) FROM gravity;",
+    ]).strip() or "0"
 
 def list_adlists():
     try:
         sql = "SELECT COALESCE(comment, 'sin nombre') || '|' || COALESCE(address, '?') FROM adlist;"
-        raw = run('{}pihole-FTL sqlite3 /etc/pihole/gravity.db "{}"'.format(SUDO, sql)).strip()
+        raw = run(SUDO + [
+            "pihole-FTL", "sqlite3", "/etc/pihole/gravity.db", sql,
+        ]).strip()
         return [r for r in raw.splitlines() if r]
     except Exception:
         return []
@@ -87,7 +103,7 @@ def list_adlists():
 def port_open(port):
     """Verifica si un puerto esta escuchando."""
     try:
-        output = run("{}ss -tlnp 2>/dev/null".format(SUDO))
+        output = run(SUDO + ["ss", "-tlnp"])
         return re.search(r':{}\s'.format(re.escape(str(port))), output) is not None
     except Exception:
         return False
@@ -97,7 +113,9 @@ def clients_24h():
     el router sigue repartiendo su propio DNS y esto esta de adorno."""
     sql = ("SELECT COUNT(DISTINCT client) FROM query_storage "
            "WHERE timestamp > strftime('%s','now','-1 day');")
-    n = run('{}pihole-FTL sqlite3 /etc/pihole/pihole-FTL.db "{}"'.format(SUDO, sql)).strip()
+    n = run(SUDO + [
+        "pihole-FTL", "sqlite3", "/etc/pihole/pihole-FTL.db", sql,
+    ]).strip()
     return n if n.isdigit() else "?"
 
 def verify():
@@ -111,18 +129,29 @@ def verify():
                   "/etc/unbound/root.hints")
     )
     # Prueba real de DNSSEC: una firma rota TIENE que ser rechazada
-    servfail = "SERVFAIL" in run(
-        "dig dnssec-failed.org @127.0.0.1 -p {} +time=3 2>/dev/null".format(uport))
+    servfail = "SERVFAIL" in run([
+        "dig", "dnssec-failed.org", "@127.0.0.1", "-p", str(uport), "+time=3",
+    ])
     # Unbound debe escuchar solo en localhost, no ser un recursivo abierto
-    localhost_only = "127.0.0.1" in run(
-        "grep -E '^[[:space:]]*interface:' {} 2>/dev/null".format(UNBOUND_CONF))
+    try:
+        with open(UNBOUND_CONF, encoding="utf-8") as f:
+            localhost_only = any(
+                re.match(r"^\s*interface:\s*127\.0\.0\.1\s*$", line)
+                for line in f
+            )
+    except OSError:
+        localhost_only = False
 
     # En pihole.toml v6 el valor va en la linea SIGUIENTE a "upstreams = [",
     # asi que un grep simple nunca lo encuentra. Se usa la API de Pi-hole, y
     # solo se cae al fichero (con -A3) si no hay CLI v6.
-    upstream_raw = run("{}pihole-FTL --config dns.upstreams 2>/dev/null".format(SUDO))
+    upstream_raw = run(SUDO + ["pihole-FTL", "--config", "dns.upstreams"])
     if not upstream_raw:
-        upstream_raw = run("{}grep -A3 upstreams /etc/pihole/pihole.toml 2>/dev/null".format(SUDO))
+        try:
+            with open("/etc/pihole/pihole.toml", encoding="utf-8") as f:
+                upstream_raw = f.read()
+        except OSError:
+            upstream_raw = ""
     upstream_ok = "127.0.0.1#{}".format(uport) in upstream_raw
 
     return {
@@ -135,8 +164,8 @@ def verify():
     }
 
 def restart():
-    run("{}systemctl restart unbound".format(SUDO))
-    run("{}systemctl restart pihole-FTL".format(SUDO))
+    run(SUDO + ["systemctl", "restart", "unbound"])
+    run(SUDO + ["systemctl", "restart", "pihole-FTL"])
 
 # --- Recoleccion de datos ---
 def collect():
@@ -190,11 +219,13 @@ def render_html(data):
     pihole_dot = "ok" if data["pihole"] else "bad"
     unbound_dot = "ok" if data["unbound"] else "bad"
     checks = "".join(
-        '<div class="check"><span>{}</span><span class="dot {}"></span></div>'.format(k, "ok" if v else "bad")
+        '<div class="check"><span>{}</span><span class="dot {}"></span></div>'.format(
+            html_lib.escape(str(k)), "ok" if v else "bad")
         for k, v in data["verify"].items()
     )
     lists = "".join(
-        '<div class="list-item">- {}</div>'.format(c) for c in data["adlists"]
+        '<div class="list-item">- {}</div>'.format(html_lib.escape(str(c)))
+        for c in data["adlists"]
     ) or '<div class="list-item">Sin listas</div>'
 
     pihole_status = "Activo" if data["pihole"] else "Caido"
@@ -234,7 +265,9 @@ def render_html(data):
         '<section><h2>Verificacion</h2>{}</section>'
         '<section><h2>Listas de bloqueo ({})</h2>{}</section>'
         '<section><h2>Acciones</h2>'
-        '  <form method="post" action="/restart"><button class="btn" type="submit">Reiniciar servicios</button></form>'
+        '  <form method="post" action="/restart">'
+        '  <input type="hidden" name="csrf_token" value="{}">'
+        '  <button class="btn" type="submit">Reiniciar servicios</button></form>'
         '</section>'
         '<footer>nexo-dns by nexo (Dark)</footer>'
         '</div></body></html>'
@@ -246,14 +279,15 @@ def render_html(data):
         clients_dot, data["clients"],
         hint,
         checks,
-        len(data["adlists"]),
-        lists
+        len(data["adlists"]), lists,
+        html_lib.escape(CSRF_TOKEN, quote=True),
     )
     return html
 
 # --- Autenticacion basica ---
 AUTH_USER = None
 AUTH_PASS = None
+CSRF_TOKEN = secrets.token_urlsafe(32)
 
 def check_auth(headers):
     if AUTH_USER is None or AUTH_PASS is None:
@@ -276,8 +310,45 @@ def check_auth(headers):
     except Exception:
         return False
 
+def csrf_valid(body):
+    """Valida el token de acciones que cambian el sistema."""
+    try:
+        token = urllib.parse.parse_qs(body, strict_parsing=True)["csrf_token"][0]
+    except (KeyError, ValueError, IndexError):
+        return False
+    return hmac.compare_digest(token, CSRF_TOKEN)
+
+def same_origin(headers):
+    """Rechaza peticiones POST enviadas desde otro sitio web."""
+    origin = headers.get("Origin")
+    if not origin:
+        return True
+    try:
+        return urllib.parse.urlsplit(origin).netloc == headers.get("Host", "")
+    except ValueError:
+        return False
+
+def is_loopback_host(host):
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
 # --- Servidor HTTP ---
 class Handler(http.server.BaseHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", (
+            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; "
+            "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        ))
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        super().end_headers()
+
     def _deny(self):
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="nexo-dns"')
@@ -319,6 +390,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._deny()
             return
         if self.path == "/restart":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 4096:
+                self.send_error(400, "Solicitud no valida")
+                return
+            try:
+                body = self.rfile.read(length).decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                self.send_error(400, "Solicitud no valida")
+                return
+            if not same_origin(self.headers) or not csrf_valid(body):
+                self.send_error(403, "Solicitud rechazada")
+                return
             restart()
             self.send_response(302)
             self.send_header("Location", "/")
@@ -335,6 +421,10 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
     ap.add_argument("--port", type=int, default=8080, help="Puerto (default: 8080)")
     ap.add_argument("--auth", help="Autenticacion basica: usuario:password")
+    ap.add_argument(
+        "--allow-unauthenticated", action="store_true",
+        help="Permite escuchar fuera de localhost sin autenticacion (peligroso)",
+    )
     args = ap.parse_args()
 
     global AUTH_USER, AUTH_PASS
@@ -344,12 +434,17 @@ def main():
             sys.exit(1)
         AUTH_USER, AUTH_PASS = args.auth.split(":", 1)
         print("Autenticacion basica habilitada para el usuario: {}".format(AUTH_USER))
-    elif args.host != "127.0.0.1":
-        print("AVISO: lo estas exponiendo a la red SIN autenticacion.")
-        print("       Usa --auth usuario:password")
+    elif not is_loopback_host(args.host) and not args.allow_unauthenticated:
+        print("Error: el panel no se expondra a la red sin autenticacion.")
+        print("       Usa --auth usuario:password o, bajo tu responsabilidad,")
+        print("       --allow-unauthenticated.")
+        sys.exit(2)
 
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer((args.host, args.port), Handler) as httpd:
+    if not is_loopback_host(args.host):
+        print("AVISO: Basic Auth no cifra el trafico. Usa Tailscale o un proxy HTTPS.")
+
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    with http.server.ThreadingHTTPServer((args.host, args.port), Handler) as httpd:
         print("Dashboard en http://{}:{}".format(args.host, args.port))
         if args.host == "0.0.0.0":
             print("  Accede desde: http://<IP-del-servidor>:{}".format(args.port))

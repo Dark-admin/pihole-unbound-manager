@@ -13,6 +13,7 @@ Pi-hole + Unbound + Tailscale, en un solo script con panel de gestión.
 ![Unbound](https://img.shields.io/badge/Unbound-2BC4DC?style=flat-square)
 ![Tailscale](https://img.shields.io/badge/Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
+[![CI](https://github.com/Dark-admin/pihole-unbound-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/Dark-admin/pihole-unbound-manager/actions/workflows/ci.yml)
 
 </div>
 
@@ -46,52 +47,54 @@ sudo bash nexo-dns.sh
 ## El panel
 
 ```
-  ╔══════════════════════════════════════════════╗
-  ║       =++*=              =++=+ +=++=         ║
-  ║        *++++=  ++*     ======= =======       ║
-  ║         +*+**+==+      ======= =======       ║
-  ║           +***#+       ======= =======       ║
-  ║           +******      ======= =======       ║
-  ║         +*******##*    ====++   ++====       ║
-  ║       *####*===*####*  =+#%++   ++%#+=       ║
-  ║       #####*   *#####   *%%%%%%%%%%%*        ║
-  ║        *###*#**##***     +%%%%%%%%%+         ║
-  ║          ********+          +%%%+            ║
-  ║            +***+                             ║
-  ║                nexo-dns v4.0                 ║
-  ╠══════════════════════════════════════════════╣
-  ║ ● Pi-hole :53   ● Unbound :5335   ● Tailsca… ║
-  ║ ip-172-31-2-205 · 172.31.2.205               ║
-  ║ ● Amazon EC2 · DNS cerrado a internet        ║
-  ╠══════════════════════════════════════════════╣
-  ║ ◆  ESTADO                                    ║
-  ║    1 Ver estado                              ║
-  ║    2 Chequeo real                            ║
-  ╠══════════════════════════════════════════════╣
-  ║ ▣  DNS                                       ║
-  ║    3 Puerto Unbound 5335                     ║
-  ║    4 Puerto Pi-hole 53                       ║
-  ║    5 Puerto web 80                           ║
-  ║    6 IP del servidor                         ║
-  ║    7 Reoptimizar Unbound                     ║
-  ║    8 Listas de bloqueo                       ║
-  ║    9 Precalentar caché                       ║
-  ╠══════════════════════════════════════════════╣
-  ║ ▼  SEGURIDAD                                 ║
-  ║   10 Exposición y cortafuegos                ║
-  ╠══════════════════════════════════════════════╣
-  ║ ▲  TAILSCALE                                 ║
-  ║   11 Instalar                                ║
-  ║   12 Optimizar                               ║
-  ╠══════════════════════════════════════════════╣
-  ║ ■  SISTEMA                                   ║
-  ║   13 Red / BBR                               ║
-  ║   14 Reiniciar servicios                     ║
-  ║   15 Copias / restaurar                      ║
-  ║   16 Instalar todo                           ║
-  ╠══════════════════════════════════════════════╣
-  ║  0 Salir                                     ║
-  ╚══════════════════════════════════════════════╝
+  ╭──────────────────────────────────────────────╮
+  │       =++*=              =++=+ +=++=         │
+  │        *++++=  ++*     ======= =======       │
+  │         +*+**+==+      ======= =======       │
+  │           +***#+       ======= =======       │
+  │           +******      ======= =======       │
+  │         +*******##*    ====++   ++====       │
+  │       *####*===*####*  =+#%++   ++%#+=       │
+  │       #####*   *#####   *%%%%%%%%%%%*        │
+  │        *###*#**##***     +%%%%%%%%%+         │
+  │          ********+          +%%%+            │
+  │            +***+                             │
+  │                nexo-dns v4.1                 │
+  │        Privado • filtrado • recursivo        │
+  ├──────────────────────────────────────────────┤
+  │ ● Pi-hole :53    ● Unbound :5335             │
+  │ ● Tailscale                                  │
+  │ HOST  raspberrypi • 192.168.1.10 • hardware │
+  ├──────────────────────────────────────────────┤
+  │ ◆ ESTADO ─────────────────────────────────── │
+  │   [ 1] › Ver estado                          │
+  │   [ 2] › Chequeo real                        │
+  ├──────────────────────────────────────────────┤
+  │ ◇ DNS ────────────────────────────────────── │
+  │   [ 3] › Puerto Unbound 5335                 │
+  │   [ 4] › Puerto Pi-hole 53                   │
+  │   [ 5] › Puerto web 80                       │
+  │   [ 6] › IP del servidor                     │
+  │   [ 7] › Reoptimizar Unbound                 │
+  │   [ 8] › Listas de bloqueo                   │
+  │   [ 9] › Precalentar caché                   │
+  ├──────────────────────────────────────────────┤
+  │ ▼ SEGURIDAD ──────────────────────────────── │
+  │   [10] › Exposición y cortafuegos            │
+  ├──────────────────────────────────────────────┤
+  │ ▲ TAILSCALE ──────────────────────────────── │
+  │   [11] › Instalar                            │
+  │   [12] › Optimizar                           │
+  ├──────────────────────────────────────────────┤
+  │ ■ SISTEMA ────────────────────────────────── │
+  │   [13] › Red / BBR                           │
+  │   [14] › Reiniciar servicios                 │
+  │   [15] › Copias / restaurar                  │
+  │   [16] › Instalar todo                       │
+  ├──────────────────────────────────────────────┤
+  │   [ 0] › Salir                               │
+  │ Selecciona una opción y pulsa Enter          │
+  ╰──────────────────────────────────────────────╯
 ```
 
 > Arriba, la talla mediana en una ventana de 50 columnas. En el terminal va
@@ -109,23 +112,25 @@ Para verlo dibujado, basta darle un color a `LOGO_BG`.
 
 ### El tema
 
-El panel **no usa el color por defecto del terminal**. Si lo hiciera heredaría
-el verde, el ámbar o lo que tenga el tema de cada uno, y no habría temática que
-valga. Todo va explícito, tomado de los dos logotipos:
+El panel **no usa el color por defecto del terminal**. La paleta parte de los
+dos logotipos y se equilibra para fondo oscuro: Pi-hole aporta coral, granate y
+verde; Unbound aporta cian e índigo. El resto se mantiene deliberadamente
+neutro para que el color indique marca o estado, no decoración al azar.
 
 | Color | Dónde |
 |---|---|
-| **Rojo `#F0392B`** de Pi-hole | secciones de estado y DNS, y el `▶` del prompt |
-| **Cian `#2BC4DC`** de Unbound | seguridad y sistema |
-| Gris de Tailscale | su propia sección |
-| Hueso sobre negro | las etiquetas |
-| Pizarra apagada | bordes y valores |
-| Blanco | **los números** |
+| Coral, granate y verde | logo de Pi-hole y sección DNS |
+| Cian e índigo | logo de Unbound, valores y sección sistema |
+| Verde, amarillo y rojo | estados correcto, atención y error |
+| Gris frío | Tailscale y texto secundario |
+| Pizarra | marco redondeado y guías de sección |
+| Blanco | etiquetas y **números seleccionables** |
 
-Los números van en blanco a propósito: son lo único que se teclea, así que son
-lo que más contraste tiene. La etiqueta va en texto normal y el valor actual
-—el puerto de cada servicio— apagado al lado, que ahorra entrar en una opción
-solo para mirar cómo está.
+Los números aparecen como controles `[ 1] ›`, con el máximo contraste. Los
+puertos y valores configurados se distinguen en cian suave, y las insignias de
+servicio usan un punto semántico sin recolorear toda la línea. El banner, el
+nombre, la versión y el lema comparten la misma cabecera tanto en el panel como
+en `nexo-dns.sh banner`.
 
 Las opciones van numeradas **del 1 al 16 en el orden en que se leen**. Antes la
 16 salía entre la 9 y la 10 porque se añadió al final, y buscarla era un
@@ -173,7 +178,7 @@ Sin abrir el panel, útiles para cron o scripts:
 | `sudo bash nexo-dns.sh optimize` | Reaplica la optimización de Unbound |
 | `sudo bash nexo-dns.sh security` | Qué tienes expuesto a internet |
 | `sudo bash nexo-dns.sh firewall` | Cierra el DNS y el panel al exterior |
-| `sudo bash nexo-dns.sh banner` | Portada |
+| `bash nexo-dns.sh banner` | Portada; no necesita root |
 
 ## En una VPS
 
@@ -284,6 +289,10 @@ Todo cambio sigue el mismo patrón:
 Las directivas que tu versión de Unbound no soporte se detectan y se eliminan
 automáticamente, en vez de dejar el servicio sin arrancar.
 
+Las copias quedan con permisos privados (`0700`) y el script bloquea una segunda
+instancia que intente modificar la configuración al mismo tiempo. El fichero
+`/etc/nexo-dns.conf` se analiza como datos: nunca se ejecuta con `source`.
+
 Desde la opción **15** puedes restaurar cualquier copia anterior.
 
 ## El detector de "¿lo usa alguien?"
@@ -345,7 +354,9 @@ comprobarla, no a ojo:
 **Lo demás:** dimensionado por RAM, generación y validación de config, arranque
 real del servicio, **rollback automático**, rechazo de puertos en conflicto e
 inválidos, cambio de puerto aplicado y persistido, degradación correcta sin
-Pi-hole instalado. `shellcheck -S warning` limpio.
+Pi-hole instalado. Cada cambio se comprueba además en GitHub Actions con
+`bash -n`, `shellcheck -S warning`, compilación de Python y pruebas de seguridad
+del panel.
 
 **Sin probar en vivo:** la instalación de Pi-hole de cero, la ruta de
 `systemd-resolved` en un Ubuntu real y el cambio de IP. Llevan copia de
@@ -362,7 +373,14 @@ sudo python3 dashboard.py --port 8080 --auth usuario:contraseña
 
 Muestra estado de servicios, dominios bloqueados, listas activas y un botón para
 reiniciar. Por defecto escucha solo en `127.0.0.1`; usa `--host 0.0.0.0` para
-abrirlo a la red, y en ese caso **pon siempre `--auth`**.
+abrirlo a la red, y en ese caso **exige `--auth`**. Si se intenta abrir fuera
+de localhost sin contraseña, el panel se niega a arrancar. Existe
+`--allow-unauthenticated` para laboratorios aislados, pero no se recomienda.
+
+Basic Auth autentica, pero no cifra el tráfico. Para administrarlo desde fuera
+de la máquina, accede por Tailscale o colócalo detrás de un proxy HTTPS. El
+panel también escapa los datos procedentes de las listas, protege el reinicio
+contra peticiones de otros sitios y envía cabeceras de seguridad al navegador.
 
 ## Desinstalar los añadidos
 
