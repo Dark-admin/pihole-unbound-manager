@@ -13,6 +13,7 @@ Pi-hole + Unbound + Tailscale, en un solo script con panel de gestión.
 ![Unbound](https://img.shields.io/badge/Unbound-2BC4DC?style=flat-square)
 ![Tailscale](https://img.shields.io/badge/Tailscale-242424?style=flat-square&logo=tailscale&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen?style=flat-square)
+[![CI](https://github.com/Dark-admin/pihole-unbound-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/Dark-admin/pihole-unbound-manager/actions/workflows/ci.yml)
 
 </div>
 
@@ -345,7 +346,9 @@ comprobarla, no a ojo:
 **Lo demás:** dimensionado por RAM, generación y validación de config, arranque
 real del servicio, **rollback automático**, rechazo de puertos en conflicto e
 inválidos, cambio de puerto aplicado y persistido, degradación correcta sin
-Pi-hole instalado. `shellcheck -S warning` limpio.
+Pi-hole instalado. Cada cambio se comprueba además en GitHub Actions con
+`bash -n`, `shellcheck -S warning`, compilación de Python y pruebas de seguridad
+del panel.
 
 **Sin probar en vivo:** la instalación de Pi-hole de cero, la ruta de
 `systemd-resolved` en un Ubuntu real y el cambio de IP. Llevan copia de
@@ -362,7 +365,14 @@ sudo python3 dashboard.py --port 8080 --auth usuario:contraseña
 
 Muestra estado de servicios, dominios bloqueados, listas activas y un botón para
 reiniciar. Por defecto escucha solo en `127.0.0.1`; usa `--host 0.0.0.0` para
-abrirlo a la red, y en ese caso **pon siempre `--auth`**.
+abrirlo a la red, y en ese caso **exige `--auth`**. Si se intenta abrir fuera
+de localhost sin contraseña, el panel se niega a arrancar. Existe
+`--allow-unauthenticated` para laboratorios aislados, pero no se recomienda.
+
+Basic Auth autentica, pero no cifra el tráfico. Para administrarlo desde fuera
+de la máquina, accede por Tailscale o colócalo detrás de un proxy HTTPS. El
+panel también escapa los datos procedentes de las listas, protege el reinicio
+contra peticiones de otros sitios y envía cabeceras de seguridad al navegador.
 
 ## Desinstalar los añadidos
 

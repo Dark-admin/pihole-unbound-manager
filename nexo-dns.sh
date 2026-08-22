@@ -815,9 +815,22 @@ prune_unsupported() {
 
 restore_unbound() {
   local d="$1"
-  [[ -f "$d/pi-hole.conf" ]] && cp -a "$d/pi-hole.conf" "$UNBOUND_CONF"
+  if [[ -f "$d/pi-hole.conf" ]]; then
+    cp -a "$d/pi-hole.conf" "$UNBOUND_CONF"
+  else
+    # En una instalación nueva no había configuración anterior. Dejar el
+    # fichero recién generado después de fallar no sería una reversión real.
+    rm -f "$UNBOUND_CONF"
+  fi
   systemctl restart unbound 2>/dev/null || true
   warn "Revertido desde $d"
+}
+
+restore_pihole() {
+  local d="$1"
+  [[ -f "$d/pihole.toml" ]] || return 0
+  cp -a "$d/pihole.toml" "$PIHOLE_TOML"
+  systemctl restart pihole-FTL 2>/dev/null || true
 }
 
 apply_unbound() {
@@ -833,13 +846,15 @@ apply_unbound() {
     || { err "Unbound no resuelve en el puerto $UNBOUND_PORT"; restore_unbound "$bkdir"; return 1; }
 
   local ad bad
-  ad=$(dig +dnssec cloudflare.com @127.0.0.1 -p "$UNBOUND_PORT" +time=5 2>/dev/null | grep -c ' ad;')
-  bad=$(dig dnssec-failed.org @127.0.0.1 -p "$UNBOUND_PORT" +time=5 2>/dev/null | grep -c 'status: SERVFAIL')
+  ad=$(dig +dnssec cloudflare.com @127.0.0.1 -p "$UNBOUND_PORT" +time=5 +tries=2 2>/dev/null | grep -c ' ad;')
+  bad=$(dig dnssec-failed.org @127.0.0.1 -p "$UNBOUND_PORT" +time=5 +tries=2 2>/dev/null | grep -c 'status: SERVFAIL')
   if [[ "$ad" == "1" && "$bad" == "1" ]]; then
     ok "DNSSEC valida (firma buena → ad, firma rota → SERVFAIL)"
   else
-    warn "DNSSEC no valida como debería (ad=$ad servfail=$bad)"
-    warn "Revisa el trust anchor: /var/lib/unbound/root.key"
+    err "DNSSEC no valida como debería (ad=$ad servfail=$bad)"
+    err "Se revierte para no dejar activo un resolver sin validación comprobada"
+    restore_unbound "$bkdir"
+    return 1
   fi
   ok "Unbound activo en 127.0.0.1#$UNBOUND_PORT"
 }
@@ -852,13 +867,25 @@ configure_pihole() {
     warn "En el panel web pon como DNS upstream:  127.0.0.1#$UNBOUND_PORT"
     return 1
   fi
-  ph_set dns.upstreams "[ \"127.0.0.1#$UNBOUND_PORT\" ]"
-  ph_set dns.dnssec false        # Unbound ya valida; hacerlo dos veces gasta CPU
-  ph_set dns.domainNeeded true   # no mandar fuera nombres sin dominio
-  ph_set dns.bogusPriv true      # ni PTR de rangos privados
-  ph_set dns.EDNS0ECS false      # ECS filtraría tu subred a los autoritativos
-  systemctl restart pihole-FTL 2>/dev/null || true
+  local failed=0
+  ph_set dns.upstreams "[ \"127.0.0.1#$UNBOUND_PORT\" ]" || failed=1
+  ph_set dns.dnssec false        || failed=1  # Unbound ya valida
+  ph_set dns.domainNeeded true   || failed=1  # no mandar fuera nombres sin dominio
+  ph_set dns.bogusPriv true      || failed=1  # ni PTR de rangos privados
+  ph_set dns.EDNS0ECS false      || failed=1  # no filtrar la subred con ECS
+  if (( failed )); then
+    err "No se pudieron aplicar todos los ajustes de Pi-hole"
+    return 1
+  fi
+  systemctl restart pihole-FTL 2>/dev/null || {
+    err "Pi-hole no se pudo reiniciar"
+    return 1
+  }
   sleep 2
+  systemctl is-active --quiet pihole-FTL || {
+    err "Pi-hole no quedó activo después de configurarlo"
+    return 1
+  }
 }
 
 apply_sysctl_dns() {
@@ -915,9 +942,27 @@ do_install() {
     ok "Pi-hole ya está instalado, no lo toco"
   else
     warn "El instalador de Pi-hole es interactivo y pide su propia configuración."
-    warn "Se lanza tal cual; cuando termine, este script sigue."
+    warn "Se descargará primero, se validará como Bash y se mostrará su hash."
     pause
-    curl -sSL https://install.pi-hole.net | bash || { err "Falló la instalación de Pi-hole"; pause; return 1; }
+    local installer installer_hash
+    installer=$(mktemp) || { err "No se pudo crear un fichero temporal"; pause; return 1; }
+    if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+         -o "$installer" https://install.pi-hole.net; then
+      rm -f "$installer"
+      err "No se pudo descargar el instalador de Pi-hole"; pause; return 1
+    fi
+    if ! bash -n "$installer" || ! grep -qi 'pi-hole' "$installer"; then
+      rm -f "$installer"
+      err "El fichero descargado no parece un instalador válido de Pi-hole"
+      pause; return 1
+    fi
+    installer_hash=$(sha256sum "$installer" | awk '{print $1}')
+    info "SHA-256 del instalador descargado: $installer_hash"
+    if ! bash "$installer"; then
+      rm -f "$installer"
+      err "Falló la instalación de Pi-hole"; pause; return 1
+    fi
+    rm -f "$installer"
   fi
   detect_pihole
 
@@ -930,7 +975,13 @@ do_install() {
   apply_unbound "$bk" || { pause; return 1; }
 
   step "6/6 · Enlazar Pi-hole con Unbound"
-  configure_pihole
+  if ! configure_pihole; then
+    err "La configuración no quedó completa; restaurando la copia anterior"
+    restore_pihole "$bk"
+    restore_unbound "$bk"
+    pause
+    return 1
+  fi
   save_conf
   echo
   ok "Instalación terminada"
@@ -985,14 +1036,19 @@ change_unbound_port() {
       warn "Pi-hole no está instalado: cuando lo instales, apunta su upstream"
       warn "a 127.0.0.1#$np"
     else
-      ph_set dns.upstreams "[ \"127.0.0.1#$np\" ]"
-      systemctl restart pihole-FTL 2>/dev/null || true; sleep 2
+      if ph_set dns.upstreams "[ \"127.0.0.1#$np\" ]" \
+         && systemctl restart pihole-FTL 2>/dev/null; then
+        sleep 2
+      else
+        err "No se pudo reapuntar Pi-hole; revirtiendo"
+        UNBOUND_PORT="$old"; restore_pihole "$bk"; restore_unbound "$bk"
+        pause; return
+      fi
       if dig +short +time=5 google.com @127.0.0.1 -p "$PIHOLE_PORT" >/dev/null 2>&1; then
         save_conf; ok "Unbound movido del $old al $np y Pi-hole apuntando ahí"
       else
         err "Pi-hole dejó de resolver; revirtiendo"
-        UNBOUND_PORT="$old"; restore_unbound "$bk"
-        ph_set dns.upstreams "[ \"127.0.0.1#$old\" ]"; systemctl restart pihole-FTL
+        UNBOUND_PORT="$old"; restore_pihole "$bk"; restore_unbound "$bk"
       fi
     fi
   else
@@ -1583,7 +1639,15 @@ do_optimize() {
   local bk; bk=$(backup_now); info "Copia en $bk"
   apply_sysctl_dns
   write_unbound_conf
-  apply_unbound "$bk" && configure_pihole && { save_conf; ok "Optimización aplicada"; }
+  if apply_unbound "$bk"; then
+    if configure_pihole; then
+      save_conf; ok "Optimización aplicada"
+    else
+      err "No se pudo configurar Pi-hole; restaurando la copia anterior"
+      restore_pihole "$bk"
+      restore_unbound "$bk"
+    fi
+  fi
   pause
 }
 
