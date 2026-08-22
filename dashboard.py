@@ -2,7 +2,7 @@
 """
 dashboard.py - Panel web para Pi-hole + Unbound
 Autor: nexo (Dark)
-v4.0 - Alineado con nexo-dns.sh y endurecido para uso en red.
+v4.1 - Alineado con nexo-dns.sh y endurecido para uso en red.
 
 Uso:
     sudo python3 dashboard.py [--port 8080] [--host 0.0.0.0] [--auth usuario:password]
