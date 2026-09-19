@@ -88,7 +88,8 @@ sudo bash nexo-dns.sh
   │        *###*#**##***     +%%%%%%%%%+         │
   │          ********+          +%%%+            │
   │            +***+                             │
-  │                nexo-dns v4.2                 │
+  │        Pi-hole • Unbound • Tailscale         │
+  │                nexo-dns v4.3                 │
   │        Privado • filtrado • recursivo        │
   ├──────────────────────────────────────────────┤
   │ ● Pi-hole :53    ● Unbound :5335             │
@@ -138,14 +139,17 @@ sudo bash nexo-dns.sh
 > filtro activo**: coral con Pi-hole, verde con AdGuard. Se ve cuál manda sin
 > leer nada.
 
-> Arriba, la talla mediana en una ventana de 50 columnas. En el terminal va
-> coloreado: las hojas de Pi-hole en verde y la frambuesa en rojo, los brazos
-> de Unbound en cian y el galón en azul.
+> Arriba, la talla mediana en una ventana de 50 columnas. El primer logo sigue
+> al filtro activo: Pi-hole usa hojas verdes y frambuesa coral; AdGuard usa su
+> escudo verde con una marca clara. Unbound conserva sus brazos cian y el galón
+> índigo. Cambiar de motor no mueve el marco ni las columnas.
 
 ### Los logotipos
 
 Arte ASCII al estilo de **screenfetch** y **neofetch**, empotrado en el script
 como arrays de texto que se pueden editar a mano: son literalmente el dibujo.
+La pareja visible siempre es **filtro activo + Unbound**; hay versiones grandes
+y reducidas de Pi-hole, AdGuard Home y Unbound.
 
 El carácter `@` es el **fondo** —el hueco del molinillo de Pi-hole, la
 separación entre los brazos de Unbound— y no se pinta, igual que hace neofetch.
@@ -154,13 +158,15 @@ Para verlo dibujado, basta darle un color a `LOGO_BG`.
 ### El tema
 
 El panel **no usa el color por defecto del terminal**. La paleta parte de los
-dos logotipos y se equilibra para fondo oscuro: Pi-hole aporta coral, granate y
-verde; Unbound aporta cian e índigo. El resto se mantiene deliberadamente
+los logotipos y se equilibra para fondo oscuro: Pi-hole aporta coral, granate y
+verde; AdGuard aporta bosque, verde de marca y menta; Unbound aporta cian e
+índigo. El resto se mantiene deliberadamente
 neutro para que el color indique marca o estado, no decoración al azar.
 
 | Color | Dónde |
 |---|---|
 | Coral, granate y verde | logo de Pi-hole y sección DNS |
+| Bosque, verde y menta | escudo de AdGuard Home y sección DNS cuando está activo |
 | Cian e índigo | logo de Unbound, valores y sección sistema |
 | Verde, amarillo y rojo | estados correcto, atención y error |
 | Gris frío | Tailscale y texto secundario |
@@ -190,8 +196,8 @@ mitad y el dibujo se deshace.
 | Ventana | Qué sale |
 |---|---|
 | 68 columnas y 56 filas o más | Logotipos completos de 30 columnas, menú a dos columnas |
-| 40 columnas o más | Los mismos logotipos reducidos a la mitad, 15 columnas |
-| Menos | Sin dibujo y menú a una columna — **teléfono de pie** |
+| 40 a 67 columnas | Logotipos reducidos de 15 columnas y menú a una columna |
+| Menos de 40 | Sin dibujo y menú a una columna — **teléfono de pie** |
 
 Los dibujos pequeños **salen del grande**: se promedia la densidad de cada
 bloque de 2×2 y se vuelve a mapear a la misma rampa de caracteres. No son otro
@@ -201,6 +207,14 @@ Se puede forzar con `NEXO_LOGO=grande`, `mini` o `no`:
 
 ```bash
 NEXO_LOGO=mini sudo -E bash nexo-dns.sh
+```
+
+También se puede previsualizar la identidad de cada motor sin root y sin tocar
+servicios:
+
+```bash
+NEXO_ENGINE=adguard NEXO_LOGO=mini bash nexo-dns.sh banner
+NEXO_ENGINE=pihole  NEXO_LOGO=mini bash nexo-dns.sh banner
 ```
 
 El color se resuelve al arrancar según lo que soporte el terminal —truecolor,
@@ -344,6 +358,10 @@ Todo cambio sigue el mismo patrón:
 Las directivas que tu versión de Unbound no soporte se detectan y se eliminan
 automáticamente, en vez de dejar el servicio sin arrancar.
 
+Los instaladores oficiales de AdGuard Home y Tailscale no se envían por tubería
+al shell: se descargan a un temporal mediante HTTPS, se valida su sintaxis y el
+contenido esperado, se muestra su SHA-256 y solo entonces se ejecutan.
+
 Las copias quedan con permisos privados (`0700`) y el script bloquea una segunda
 instancia que intente modificar la configuración al mismo tiempo. El fichero
 `/etc/nexo-dns.conf` se analiza como datos: nunca se ejecuta con `source`.
@@ -411,7 +429,10 @@ real del servicio, **rollback automático**, rechazo de puertos en conflicto e
 inválidos, cambio de puerto aplicado y persistido, degradación correcta sin
 Pi-hole instalado. Cada cambio se comprueba además en GitHub Actions con
 `bash -n`, `shellcheck -S warning`, compilación de Python y pruebas de seguridad
-del panel.
+del panel. La versión 4.3 mantiene 13 pruebas de regresión: ocho del panel web y
+cinco del script/TUI, incluidas ambas marcas, los tres tamaños, los cortes
+responsive, la alineación del marco y la prohibición de enviar instaladores
+remotos directamente al shell.
 
 **Sin probar en vivo:** la instalación de Pi-hole de cero, la ruta de
 `systemd-resolved` en un Ubuntu real y el cambio de IP. Llevan copia de

@@ -3,7 +3,7 @@
 #  nexo-dns.sh — Instalador y panel de DNS privado
 #  Pi-hole o AdGuard Home + Unbound + Tailscale
 #
-#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.2
+#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.3
 #  Compatible: Raspberry Pi OS · Debian 11+ · Ubuntu 20.04+ · VPS
 #
 #  Uso:
@@ -37,7 +37,7 @@ fi
 
 # OJO: no llamarla VERSION. /etc/os-release define VERSION y al leerlo
 # machacaría la nuestra ("nexo-dns v13 (trixie)").
-NEXO_VERSION="4.2"
+NEXO_VERSION="4.3"
 CONF=/etc/nexo-dns.conf
 UNBOUND_CONF=/etc/unbound/unbound.conf.d/pi-hole.conf
 PIHOLE_TOML=/etc/pihole/pihole.toml
@@ -54,6 +54,7 @@ AGH_SVC=AdGuardHome
 # ══════════════════════════════════════════════════════════ presentación ═══════
 # Paleta inspirada en ambas marcas y equilibrada para fondo oscuro:
 #   Pi-hole   coral + granate + verde de las hojas
+#   AdGuard   verde bosque + verde de marca + menta
 #   Unbound   cian + índigo
 # Se usa la mayor profundidad de color que soporte el terminal y se degrada
 # hasta ANSI de 8 colores sin perder legibilidad. NO_COLOR=1 lo desactiva todo.
@@ -102,7 +103,9 @@ if (( COLOR_DEPTH )); then
   # AdGuard Home entra con su verde de marca. NO se usa para la cabecera de su
   # sección: ESTADO ya lleva verde y dos verdes en la misma columna no se
   # distinguen. La sección del motor va en índigo, que estaba libre.
-  AG=$(fg  103 178 121  71 '1;32')   # AdGuard  verde      #67B279
+  AGD=$(fg  47 141  70  28 '0;32')   # AdGuard  bosque     #2F8D46
+  AG=$(fg  103 178 121  71 '1;32')   # AdGuard  marca      #67B279
+  AGL=$(fg 158 215 168 157 '1;32')   # AdGuard  menta      #9ED7A8
   TS=$(fg  203 213 225 252 '0;37')   # Tailscale, gris frío
   # ── Interfaz ─────────────────────────────────────────────────────────
   TXT=$(fg 241 245 249 255 '0;37')   # texto principal, blanco frío
@@ -117,7 +120,7 @@ if (( COLOR_DEPTH )); then
   BLU="$UB"
   DIM=$'\033[2m'; BLD=$'\033[1m'; NC=$'\033[0m'
 else
-  PH=''; PHD=''; PHG=''; UB=''; UBN=''; UBC=''; AG=''; TS=''
+  PH=''; PHD=''; PHG=''; UB=''; UBN=''; UBC=''; AGD=''; AG=''; AGL=''; TS=''
   TXT=''; MUT=''; LIN=''; NUM=''; VAL=''
   GRN=''; YEL=''; RED=''; BLU=''
   RED=''; GRN=''; YEL=''; BLU=''; DIM=''; BLD=''; NC=''
@@ -201,6 +204,48 @@ LOGO_PIH_MIN=(
   '@@@********+@@@'
   '@@@@@+***+@@@@@'
 )
+# AdGuard Home: escudo con una marca de verificación. Comparte la misma caja de
+# 30x22 (y 15x11 en mini) que Pi-hole, por lo que cambiar de motor no mueve ni
+# una columna de la cabecera.
+# shellcheck disable=SC2034  # por nameref desde render_logo
+LOGO_AGH=(
+  '@@@@@@@@@############@@@@@@@@@'
+  '@@@@@@@################@@@@@@@'
+  '@@@@@####################@@@@@'
+  '@@@@######################@@@@'
+  '@@@########################@@@'
+  '@@@########################@@@'
+  '@@@###############++#######@@@'
+  '@@@##############+++#######@@@'
+  '@@@#############++++#######@@@'
+  '@@@@####+######++++#######@@@@'
+  '@@@@####++####+++++#######@@@@'
+  '@@@@@####+++++++++#######@@@@@'
+  '@@@@@#####+++++++########@@@@@'
+  '@@@@@@#####+++++########@@@@@@'
+  '@@@@@@######+++#########@@@@@@'
+  '@@@@@@@######+#########@@@@@@@'
+  '@@@@@@@@##############@@@@@@@@'
+  '@@@@@@@@@############@@@@@@@@@'
+  '@@@@@@@@@@##########@@@@@@@@@@'
+  '@@@@@@@@@@@########@@@@@@@@@@@'
+  '@@@@@@@@@@@@######@@@@@@@@@@@@'
+  '@@@@@@@@@@@@@####@@@@@@@@@@@@@'
+)
+# shellcheck disable=SC2034  # por nameref desde render_logo
+LOGO_AGH_MIN=(
+  '@@@@#######@@@@'
+  '@@@#########@@@'
+  '@@###########@@'
+  '@##########+##@'
+  '@####+####++##@'
+  '@###++++++####@'
+  '@@###++++####@@'
+  '@@@###++####@@@'
+  '@@@@#######@@@@'
+  '@@@@@#####@@@@@'
+  '@@@@@@###@@@@@@'
+)
 # shellcheck disable=SC2034  # por nameref desde render_logo
 LOGO_UNB_MIN=(
   '@@=++=+@+=++=@@'
@@ -240,7 +285,7 @@ LOGO_UNB=(
 )
 
 # Devuelve el color de una celda del dibujo.
-logo_color() {   # $1 PIH|UNB · $2 fila · $3 caracter · $4 nº de filas del dibujo
+logo_color() {   # $1 PIH|AGH|UNB · $2 fila · $3 caracter · $4 nº de filas
   [[ "$3" == '@' ]] && { printf '%s' "$LOGO_BG"; return; }
   # Las fronteras van en proporcion al alto para que valgan igual con el dibujo
   # grande de 22 filas y con el reducido de 11.
@@ -249,6 +294,11 @@ logo_color() {   # $1 PIH|UNB · $2 fila · $3 caracter · $4 nº de filas del d
     if   (( r <= 6  )); then printf '%s' "$PHG"     # hojas
     elif (( r <= 13 )); then printf '%s' "$PH"      # baya, mitad de arriba
     else                     printf '%s' "$PHD"     # baya, mitad de abajo
+    fi
+  elif [[ "$1" == AGH ]]; then
+    if [[ "$3" == '+' ]]; then printf '%s' "$AGL" # marca de verificación
+    elif (( r <= 10 )); then printf '%s' "$AG"     # mitad iluminada
+    else                       printf '%s' "$AGD"   # base del escudo
     fi
   else
     if   (( r <= 12 )); then printf '%s' "$UB"      # brazos cian
@@ -261,7 +311,7 @@ logo_color() {   # $1 PIH|UNB · $2 fila · $3 caracter · $4 nº de filas del d
 # Pinta un dibujo, agrupando las tiradas del mismo color en una sola secuencia
 # en vez de emitir un escape por caracter.
 ASCII_OUT=()
-render_logo() {         # $1 nombre del array · $2 etiqueta PIH|UNB
+render_logo() {         # $1 nombre del array · $2 etiqueta PIH|AGH|UNB
   local -n _a="$1"
   local r i ch col prev line n=${#_a[@]}
   ASCII_OUT=()
@@ -282,14 +332,20 @@ render_logo() {         # $1 nombre del array · $2 etiqueta PIH|UNB
 BANNER_ROWS=()
 build_banner() {   # $1 = grande|mini
   local -a L R
-  local hueco
+  local hueco filter_array filter_tag
+  if [[ "${ENGINE:-pihole}" == adguard ]]; then
+    filter_array=LOGO_AGH; filter_tag=AGH
+  else
+    filter_array=LOGO_PIH; filter_tag=PIH
+  fi
   if [[ "${1:-grande}" == mini ]]; then
-    render_logo LOGO_PIH_MIN PIH; L=( "${ASCII_OUT[@]}" )
+    filter_array+='_MIN'
+    render_logo "$filter_array" "$filter_tag"; L=( "${ASCII_OUT[@]}" )
     render_logo LOGO_UNB_MIN UNB; R=( "${ASCII_OUT[@]}" )
     hueco='               '                      # 15 espacios
     R=( "${R[@]}" "$hueco" )
   else
-    render_logo LOGO_PIH PIH; L=( "${ASCII_OUT[@]}" )
+    render_logo "$filter_array" "$filter_tag"; L=( "${ASCII_OUT[@]}" )
     render_logo LOGO_UNB UNB; R=( "${ASCII_OUT[@]}" )
     # Unbound tiene dos filas menos: se centra para que no quede colgando.
     hueco='                              '        # 30 espacios
@@ -328,14 +384,16 @@ term_dim() {          # $1 = lines|cols
   printf '%s' "$v"
 }
 
-LAYOUT=texto; MENU_COLS=2
+LAYOUT=texto; MENU_COLS=1
 elegir_layout() {
   local c l w
   c=$(term_dim cols); l=$(term_dim lines)
   # el cuadro necesita 6 columnas de margen: 2 de sangría, 2 bordes, 2 huecos
   w=$(( c - 6 )); (( w > 64 )) && w=64; (( w < 28 )) && w=28
   set_boxw "$w"
-  MENU_COLS=2; (( BOXW < 50 )) && MENU_COLS=1
+  # La opción más larga de cada pareja necesita 30 columnas. Con menos de 62
+  # columnas interiores, dos columnas se pegaban entre sí y parecían una sola.
+  MENU_COLS=1; (( BOXW >= 62 )) && MENU_COLS=2
   case "${NEXO_LOGO:-auto}" in
     grande) LAYOUT=grande; return ;;
     mini)   LAYOUT=mini;   return ;;
@@ -430,12 +488,19 @@ sec() {  # $1 icono · $2 color · $3 título
 # Pinta los elementos de un menú en una o dos columnas según quepa.
 menu_items() {
   local -a it=("$@")
-  local i w
+  local i w lw rw
   if (( MENU_COLS >= 2 )); then
     w=$(( (BOXW - 3) / 2 ))
     for (( i=0; i<${#it[@]}; i+=2 )); do
       if (( i+1 < ${#it[@]} )); then
-        brow "  $(pad_to "${it[i]}" "$w")${it[i+1]}"
+        # Segunda defensa para etiquetas futuras: si una pareja crece, baja a
+        # dos filas en lugar de invadir silenciosamente la columna vecina.
+        lw=$(vislen "${it[i]}"); rw=$(vislen "${it[i+1]}")
+        if (( lw <= w && rw <= w )); then
+          brow "  $(pad_to "${it[i]}" "$w")${it[i+1]}"
+        else
+          brow "  ${it[i]}"; brow "  ${it[i+1]}"
+        fi
       else
         brow "  ${it[i]}"
       fi
@@ -455,15 +520,16 @@ banner_rows() { printf '%s\n' "${BANNER_ROWS[@]}"; }
 # Cabecera compartida por el panel y la portada. Así el banner no es un adorno
 # separado: logos, nombre, versión y lema forman una sola identidad visual.
 draw_brand_header() {
-  local r
+  local r filter_name filter_col
+  filter_name=$(engine_name); filter_col=$(engine_color)
   case "$LAYOUT" in
     grande|mini)
       build_banner "$LAYOUT"
       while IFS= read -r r; do bcenter "$r"; done < <(banner_rows) ;;
     *)
-      brow ''
-      bcenter "${PH}${BLD}Pi-hole${NC} ${LIN}${BULLET}${NC} ${UB}${BLD}Unbound${NC} ${LIN}${BULLET}${NC} ${TS}Tailscale${NC}" ;;
+      brow '' ;;
   esac
+  bcenter "${filter_col}${BLD}${filter_name}${NC} ${LIN}${BULLET}${NC} ${UB}${BLD}Unbound${NC} ${LIN}${BULLET}${NC} ${TS}Tailscale${NC}"
   bcenter "${BLD}${TXT}nexo-dns${NC} ${MUT}v$NEXO_VERSION${NC}"
   bcenter "${MUT}Privado ${LIN}${BULLET}${NC} ${MUT}filtrado ${LIN}${BULLET}${NC} ${MUT}recursivo${NC}"
   [[ "$LAYOUT" == texto ]] && brow ''
@@ -495,7 +561,7 @@ info() { echo "${BLU}[i]${NC} $*"; }
 ok()   { echo "${GRN}[✓]${NC} $*"; }
 warn() { echo "${YEL}[!]${NC} $*"; }
 err()  { echo "${RED}[✗]${NC} $*"; }
-step() { echo; echo "${PH}══${NC} ${BLD}${TXT}$*${NC}"; }
+step() { local accent; accent=$(engine_color); echo; echo "${accent}══${NC} ${BLD}${TXT}$*${NC}"; }
 pause(){ [[ -t 0 ]] || return 0; echo; read -rp "  ${DIM}Enter para continuar...${NC} " _ || true; }
 ask()  { local p="$1" d="${2:-}" r; read -rp "  $p " r || true; echo "${r:-$d}"; }
 yes_no(){ local r; r=$(ask "$1 [s/N]"); [[ "$r" =~ ^[sSyY]$ ]]; }
@@ -740,6 +806,28 @@ agh_block_list() {   # igual que agh_get pero para claves lista, una por línea
 # pueden convivir instalados, pero solo uno puede quedarse el puerto 53.
 ENGINE=""
 valid_engine() { [[ "$1" == "pihole" || "$1" == "adguard" ]]; }
+
+# `banner` no pide root ni sondea servicios, pero sí debe enseñar la marca del
+# motor elegido. NEXO_ENGINE sirve para previsualizar ambas variantes; sin él se
+# lee únicamente la clave ENGINE de la configuración, tratándola como datos.
+load_banner_engine() {
+  local requested="${NEXO_ENGINE:-}" key value
+  if [[ -n "$requested" ]]; then
+    valid_engine "$requested" || { err "NEXO_ENGINE debe ser pihole o adguard"; return 1; }
+    ENGINE="$requested"
+    return 0
+  fi
+  ENGINE=""
+  if [[ -r "$CONF" ]]; then
+    while IFS='=' read -r key value; do
+      if [[ "$key" == ENGINE ]] && valid_engine "$value"; then
+        ENGINE="$value"
+        break
+      fi
+    done < "$CONF"
+  fi
+  valid_engine "$ENGINE" || ENGINE=pihole
+}
 
 detect_engine() {
   detect_pihole; detect_adguard
@@ -1235,11 +1323,11 @@ stop_engine_svc() {
   sleep 1
 }
 
-# Descarga e instala AdGuard Home con su instalador oficial. Mismo criterio que
-# el de Pi-hole en v4.1: se baja a un temporal, se valida como Bash, se enseña
-# el SHA-256 y solo entonces se ejecuta.
-fetch_and_run_installer() {   # $1 URL · $2 palabra que debe aparecer dentro
+# Descarga un instalador oficial con el mismo criterio para AdGuard y Tailscale:
+# temporal, HTTPS, sintaxis válida, palabra esperada y SHA-256 antes de ejecutar.
+fetch_and_run_installer() {   # $1 URL · $2 palabra esperada · $3... argumentos
   local url="$1" needle="$2" f hash
+  shift 2
   f=$(mktemp) || { err "No se pudo crear un fichero temporal"; return 1; }
   if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
        --connect-timeout 10 --max-time 120 -o "$f" "$url"; then
@@ -1250,7 +1338,7 @@ fetch_and_run_installer() {   # $1 URL · $2 palabra que debe aparecer dentro
   fi
   hash=$(sha256sum "$f" | awk '{print $1}')
   info "SHA-256 del instalador descargado: $hash"
-  if ! sh "$f" -v; then rm -f "$f"; return 1; fi
+  if ! sh "$f" "$@"; then rm -f "$f"; return 1; fi
   rm -f "$f"
 }
 
@@ -1277,7 +1365,7 @@ install_adguard() {
   step "1/4 · Descarga e instalación"
   if ! fetch_and_run_installer \
        "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh" \
-       "adguard"; then
+       "adguard" -v; then
     err "Falló la instalación de AdGuard Home"; pause; return 1
   fi
   detect_adguard
@@ -1475,7 +1563,7 @@ do_install() {
       pause
       fetch_and_run_installer \
         "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh" \
-        "adguard" \
+        "adguard" -v \
         || { err "Falló la instalación de AdGuard Home"; pause; return 1; }
       detect_adguard
     fi
@@ -1841,7 +1929,8 @@ install_tailscale() {
     ok "Ya instalado: $(tailscale version 2>/dev/null | head -1)"
   else
     info "Descargando el instalador oficial de tailscale.com..."
-    curl -fsSL https://tailscale.com/install.sh | sh || { err "Falló la instalación"; pause; return; }
+    fetch_and_run_installer "https://tailscale.com/install.sh" "tailscale" \
+      || { err "Falló la instalación"; pause; return; }
     ok "Tailscale instalado"
   fi
   echo
@@ -2779,7 +2868,7 @@ COMMAND="${1:-panel}"
 case "$COMMAND" in
   -v|--version) echo "nexo-dns $NEXO_VERSION"; exit 0 ;;
   -h|--help)    sed -n '2,28p' "$0"; exit 0 ;;
-  banner)       splash; exit 0 ;;
+  banner)       load_banner_engine || exit 1; splash; exit 0 ;;
   install|status|health|optimize|security|firewall|engine|panel) ;;
   *) err "Orden desconocida: $COMMAND"; sed -n '2,28p' "$0"; exit 1 ;;
 esac
