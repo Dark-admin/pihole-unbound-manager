@@ -20,11 +20,14 @@ jobs:
         run: bash -n nexo-dns.sh
       - name: Ejecutar ShellCheck
         run: shellcheck -S warning nexo-dns.sh
-      - name: Probar portada sin root ni color
+      - name: Probar portadas de ambos motores sin root ni color
         run: |
-          NO_COLOR=1 TERM=xterm NEXO_LOGO=mini bash nexo-dns.sh banner > /tmp/banner.txt
-          grep -q "nexo-dns v4.2" /tmp/banner.txt
-          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.2"
+          NO_COLOR=1 TERM=xterm NEXO_ENGINE=pihole NEXO_LOGO=mini bash nexo-dns.sh banner > /tmp/banner-pihole.txt
+          NO_COLOR=1 TERM=xterm NEXO_ENGINE=adguard NEXO_LOGO=mini bash nexo-dns.sh banner > /tmp/banner-adguard.txt
+          grep -q "Pi-hole.*Unbound.*Tailscale" /tmp/banner-pihole.txt
+          grep -q "AdGuard Home.*Unbound.*Tailscale" /tmp/banner-adguard.txt
+          grep -q "nexo-dns v4.3" /tmp/banner-adguard.txt
+          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.3"
 
   python:
     name: Python ${{ matrix.python-version }}

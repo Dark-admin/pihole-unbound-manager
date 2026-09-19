@@ -9,6 +9,8 @@ class DashboardSecurityTests(unittest.TestCase):
     def sample_data(self):
         return {
             "timestamp": "2026-08-21 12:00:00",
+            "engine": "adguard",
+            "engine_label": "AdGuard Home",
             "pihole": True,
             "unbound": True,
             "dns_pihole": "192.0.2.1",
@@ -30,6 +32,17 @@ class DashboardSecurityTests(unittest.TestCase):
         page = dashboard.render_html(self.sample_data())
         self.assertIn('name="csrf_token"', page)
         self.assertIn(dashboard.CSRF_TOKEN, page)
+
+    def test_render_uses_active_engine_theme(self):
+        page = dashboard.render_html(self.sample_data())
+        self.assertIn('class="engine-adguard"', page)
+        self.assertIn("AdGuard Home", page)
+
+    def test_unknown_engine_falls_back_to_pihole_theme(self):
+        data = self.sample_data()
+        data["engine"] = "valor-manipulado"
+        page = dashboard.render_html(data)
+        self.assertIn('class="engine-pihole"', page)
 
     def test_csrf_requires_exact_token(self):
         good = "csrf_token={}".format(

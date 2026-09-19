@@ -2,6 +2,7 @@
 """
 dashboard.py - Panel web para Pi-hole o AdGuard Home + Unbound
 Autor: nexo (Dark)
+v4.3 - Identidad visual compartida con el TUI y acento según el motor activo.
 v4.2 - Sigue al motor activo: lee ENGINE de /etc/nexo-dns.conf y saca los
        datos de gravity.db o de AdGuardHome.yaml + querylog.json.
 v4.1 - Alineado con nexo-dns.sh y endurecido para uso en red.
@@ -295,6 +296,7 @@ def restart():
 def collect():
     return {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "engine": engine(),
         "engine_label": engine_label(),
         "pihole": service_active(engine_svc()),
         "unbound": service_active("unbound"),
@@ -310,32 +312,35 @@ def collect():
 CSS = """
 :root{
   --bg:#0d1117; --panel:#161b22; --panel2:#21262d; --line:#30363d;
-  --green:#3fb950; --red:#f85149; --yellow:#d29922; --text:#e6edf3; --muted:#8b949e;
-  --accent:#58a6ff; --orange:#ff7b00;
+  --green:#22c55e; --red:#ef4444; --yellow:#facc15; --text:#f1f5f9; --muted:#94a3b8;
+  --cyan:#22d3ee; --indigo:#6366f1; --coral:#f43f5e; --adguard:#67b279;
+  --accent:var(--coral); --accent-soft:rgba(244,63,94,.2);
 }
+body.engine-adguard{--accent:var(--adguard);--accent-soft:rgba(103,178,121,.22)}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:2rem}
 .wrap{max-width:1000px;margin:0 auto}
 .logo-box{display:flex;flex-direction:column;align-items:center;margin-bottom:1.5rem}
-.logo-box img{width:160px;height:160px;border-radius:24px;box-shadow:0 0 40px rgba(255,123,0,.25)}
+.logo-box img{width:160px;height:160px;border-radius:24px;box-shadow:0 0 44px rgba(34,211,238,.16)}
 .logo-box .tag{margin-top:.6rem;font-size:.85rem;color:var(--muted);letter-spacing:.05em}
 header{display:flex;align-items:center;justify-content:space-between;margin-bottom:2rem;border-bottom:1px solid var(--line);padding-bottom:1rem}
-h1{font-size:1.6rem;font-weight:700}
+h1{font-size:1.6rem;font-weight:700;text-decoration:underline;text-decoration-color:var(--accent);text-underline-offset:.35rem}
 .badge{font-size:.8rem;padding:.3rem .7rem;border-radius:999px;background:var(--panel2);color:var(--muted)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;margin-bottom:2rem}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1.2rem}
+.card{background:linear-gradient(145deg,var(--panel),#111827);border:1px solid var(--line);border-top-color:var(--accent);border-radius:12px;padding:1.2rem;box-shadow:0 10px 26px rgba(0,0,0,.14)}
 .card .label{font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
 .card .value{font-size:1.5rem;font-weight:700;margin-top:.4rem}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:.5rem}
 .ok{background:var(--green)} .bad{background:var(--red)} .warn{background:var(--yellow)}
 section{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:1.5rem;margin-bottom:1.5rem}
-section h2{font-size:1.1rem;margin-bottom:1rem;color:var(--accent)}
+section h2{font-size:1.1rem;margin-bottom:1rem;color:var(--cyan)}
 .check{display:flex;align-items:center;justify-content:space-between;padding:.5rem 0;border-bottom:1px solid var(--line)}
 .check:last-child{border-bottom:none}
 .list-item{padding:.5rem 0;border-bottom:1px solid var(--line);font-size:.9rem}
 .list-item:last-child{border-bottom:none}
-.btn{display:inline-block;background:var(--orange);color:#000;padding:.6rem 1.2rem;border-radius:8px;font-weight:600;border:none;cursor:pointer;text-decoration:none}
-.btn:hover{opacity:.85}
+.btn{display:inline-block;background:var(--accent);color:#071018;padding:.6rem 1.2rem;border-radius:8px;font-weight:700;border:1px solid transparent;cursor:pointer;text-decoration:none;box-shadow:0 0 0 3px var(--accent-soft)}
+.btn:hover{filter:brightness(1.08)}
+.btn:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}
 .hint{font-size:.85rem;color:var(--muted);margin-top:.6rem;line-height:1.5}
 footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:2rem}
 """
@@ -366,6 +371,7 @@ def render_html(data):
             'Revisa el DHCP de tu router: debe repartir la IP de esta maquina '
             'como UNICO servidor DNS. Un secundario publico salta el filtrado.</div>') if few else ""
 
+    engine_key = "adguard" if data.get("engine") == "adguard" else "pihole"
     html = (
         '<!DOCTYPE html>'
         '<html lang="es"><head><meta charset="UTF-8">'
@@ -374,7 +380,7 @@ def render_html(data):
         '<link rel="icon" href="/logo.svg">'
         '<style>{}</style>'
         '<meta http-equiv="refresh" content="15"></head>'
-        '<body><div class="wrap">'
+        '<body class="engine-{}"><div class="wrap">'
         '<div class="logo-box">'
         '  <img src="/logo.svg" alt="nexo-dns logo">'
         '  <div class="tag">DNS privado, filtrado y recursivo</div>'
@@ -397,7 +403,7 @@ def render_html(data):
         '<footer>nexo-dns by nexo (Dark)</footer>'
         '</div></body></html>'
     ).format(
-        CSS, data["timestamp"],
+        CSS, engine_key, data["timestamp"],
         html_lib.escape(str(data.get("engine_label", "Pi-hole FTL"))),
         pihole_dot, pihole_status,
         unbound_dot, unbound_status,
