@@ -73,6 +73,30 @@ Después, para todo lo demás:
 sudo bash nexo-dns.sh
 ```
 
+### Actualizar desde 4.3
+
+Descarga primero una copia nueva, comprueba su sintaxis y conserva el script
+anterior antes de reemplazarlo. Ejecutar `--version` no modifica servicios:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/Dark-admin/pihole-unbound-manager/main/nexo-dns.sh \
+  -o nexo-dns-4.4.sh
+bash -n nexo-dns-4.4.sh && bash nexo-dns-4.4.sh --version
+cp -a nexo-dns.sh "nexo-dns.sh.bak-$(date +%Y%m%d-%H%M%S)"
+cp nexo-dns-4.4.sh nexo-dns.sh
+sudo bash nexo-dns.sh audit
+sudo bash nexo-dns.sh firewall
+```
+
+La última orden muestra los puertos y redes que se protegerán y solicita
+confirmación. Descargar el script no actualiza las reglas ya instaladas.
+Revisa las redes de confianza antes de aplicar: un cliente de otra subred
+necesita una entrada explícita en `/etc/nexo-dns-trusted.conf`. Tras aplicar,
+prueba desde un cliente permitido y uno no permitido; comprueba también la
+carga después de reiniciar. No hace falta repetir `install` para actualizar
+el panel o el firewall. Consulta [los cambios de 4.4](CHANGELOG.md).
+
 ## El panel
 
 ```
@@ -89,7 +113,7 @@ sudo bash nexo-dns.sh
   │          ********+          +%%%+            │
   │            +***+                             │
   │        Pi-hole • Unbound • Tailscale         │
-  │                nexo-dns v4.3                 │
+  │                nexo-dns v4.4                 │
   │        Privado • filtrado • recursivo        │
   ├──────────────────────────────────────────────┤
   │ ● Pi-hole :53    ● Unbound :5335             │
@@ -254,7 +278,26 @@ La opción **10** del panel:
 - Comprueba el `listeningMode` de Pi-hole, que es lo que de verdad decide si
   respondes al mundo entero o solo a tu subred
 - Instala un cortafuegos con nftables que cierra el DNS y el panel web a
-  internet, dejándolos abiertos para loopback, redes privadas y el tailnet
+  fuentes no confiables, conservando loopback, las subredes IPv4 conectadas
+  detectadas y la interfaz `tailscale0` (sujeta a los permisos de Tailscale).
+
+En **4.4**, Pi-hole protege todos los puertos de `webserver.port`, incluyendo
+HTTPS, IPv6, direcciones específicas y puertos alternativos. Si la lectura está
+vacía, cubre además 80/443/8080/8443 y lo indica como cobertura de respaldo.
+El puerto 8080 del panel Python opcional también queda restringido. Si cambias
+su puerto, debes incluirlo expresamente en tu firewall general.
+
+Para redes adicionales o IPv6 global de tu LAN, crea `/etc/nexo-dns-trusted.conf`
+con las redes exactas que necesitas. El archivo se lee como datos, nunca se ejecuta:
+
+```ini
+IPV4=192.168.1.0/24
+IPV6=fe80::/10
+```
+
+El tráfico IPv6 global no recibe confianza automática. Las direcciones ULA de
+Tailscale entran por `tailscale0`; otras ULA necesitan autorización explícita.
+No se confía automáticamente en todo `100.64.0.0/10`.
 
 **Con AdGuard cierra además sus puertos propios**, y no es un detalle: si
 activas DNS cifrado hay un resolver esperando en **853** (DoT), **443** (DoH),
@@ -268,11 +311,24 @@ deja de escuchar.
 
 Al cambiar de motor las reglas **se regeneran solas**: el fichero `.nft` lleva
 los números escritos dentro y si no, se quedaría cerrando los del anterior.
+Al cambiar un puerto desde el panel con el firewall activo, primero se protege
+el puerto propuesto. Si falla esa preparación, se cancela el cambio. Las reglas
+anteriores se conservan junto al puerto nuevo hasta regenerar el firewall; así
+una transición o reversión no abre un puerto a orígenes no confiables.
 
-El cortafuegos **no puede dejarte fuera de la máquina**: la política de la
-cadena es `accept` y solo se descartan los puertos del DNS y del panel. El SSH
-no se toca. Después de cargarlo comprueba que la resolución sigue funcionando
-y, si no, se retira solo.
+`sudo bash nexo-dns.sh audit` ejecuta un diagnóstico de solo lectura: servicios,
+respuestas DNS reales, interfaces efectivas de Unbound, persistencia del firewall,
+SSH y paquetes pendientes según los índices locales. No modifica SSH, instala
+actualizaciones ni declara seguro un equipo solo porque haya una tabla cargada.
+
+El cortafuegos tiene política `accept` y restringe únicamente los puertos DNS y
+de administración del filtro. No es una protección general de SSH u otros
+servicios. Rechaza colisiones con el puerto SSH detectado antes de aplicar.
+Valida el candidato antes de cargarlo, respalda la tabla y archivos previos y
+exige una respuesta DNS `NOERROR` con un registro A antes y después. Si falla,
+restaura las reglas previas. Los respaldos privados quedan en
+`/var/backups/nexo-dns/firewall.*`. Tras aplicar exige que el servicio esté activo
+y habilitado; la comprobación posterior al reinicio se hace aparte.
 
 > Esto es el cortafuegos del sistema. Si tu proveedor tiene además grupos de
 > seguridad (AWS, Azure, GCP), revísalos: son una segunda puerta por delante
@@ -429,10 +485,13 @@ real del servicio, **rollback automático**, rechazo de puertos en conflicto e
 inválidos, cambio de puerto aplicado y persistido, degradación correcta sin
 Pi-hole instalado. Cada cambio se comprueba además en GitHub Actions con
 `bash -n`, `shellcheck -S warning`, compilación de Python y pruebas de seguridad
-del panel. La versión 4.3 mantiene 13 pruebas de regresión: ocho del panel web y
-cinco del script/TUI, incluidas ambas marcas, los tres tamaños, los cortes
-responsive, la alineación del marco y la prohibición de enviar instaladores
-remotos directamente al shell.
+del panel. La versión 4.4 amplía la suite a 40 pruebas de regresión: HTTP,
+credenciales, puertos y confianza del firewall, respuestas DNS y TUI. Se conserva
+la comprobación de ambas marcas, los tres tamaños, los cortes responsive y la
+prohibición de enviar instaladores remotos directamente al shell. Otra prueba
+usa nftables real y tráfico TCP/UDP dentro de namespaces aislados; comprueba
+bloqueo, idempotencia y restauración. En esa prueba se simulan systemd y la
+resolución DNS; no equivale a comprobar el arranque real de un servidor.
 
 **Sin probar en vivo:** la instalación de Pi-hole de cero, la ruta de
 `systemd-resolved` en un Ubuntu real y el cambio de IP. Llevan copia de
@@ -444,19 +503,53 @@ repuesto.
 `dashboard.py` es un panel **web** de solo lectura, aparte del TUI:
 
 ```bash
-sudo python3 dashboard.py --port 8080 --auth usuario:contraseña
+sudo install -m 600 /dev/null /etc/nexo-dashboard.auth
+sudo nano /etc/nexo-dashboard.auth
+# Escribe una sola línea usuario:contraseña y guarda.
+sudo python3 dashboard.py --port 8080 --auth-file /etc/nexo-dashboard.auth
 ```
 
-Muestra estado de servicios, dominios bloqueados, listas activas y un botón para
-reiniciar. Por defecto escucha solo en `127.0.0.1`; usa `--host 0.0.0.0` para
-abrirlo a la red, y en ese caso **exige `--auth`**. Si se intenta abrir fuera
+Muestra estado de servicios, dominios bloqueados y listas activas. En 4.4 es de
+solo lectura por defecto; `--allow-restart` habilita explícitamente el botón y
+la acción de reinicio. Por defecto escucha solo en `127.0.0.1`; una escucha en
+una IP de red **exige autenticación** (`--auth-file` o `--auth`). Si se intenta abrir fuera
 de localhost sin contraseña, el panel se niega a arrancar. Existe
 `--allow-unauthenticated` para laboratorios aislados, pero no se recomienda.
+Una escucha global en `0.0.0.0` o `::` exige también `--allowed-host` con cada
+nombre o IP autorizado para acceder. Una escucha en una IP concreta permite
+esa IP; puedes añadir nombres con la misma opción. Esto ayuda a evitar DNS
+rebinding y rechaza solicitudes con un Host inesperado.
 
 Basic Auth autentica, pero no cifra el tráfico. Para administrarlo desde fuera
-de la máquina, accede por Tailscale o colócalo detrás de un proxy HTTPS. El
+de la máquina, puedes conservar la escucha local y usar un túnel SSH:
+
+```bash
+# Desde tu equipo; cambia usuario y servidor por los tuyos.
+ssh -N -L 8080:127.0.0.1:8080 usuario@servidor
+# Abre http://127.0.0.1:8080 en tu navegador.
+```
+
+También puedes enlazarlo a la IP de Tailscale con autenticación y permisos
+limitados, o colocarlo detrás de un proxy HTTPS privado. El
 panel también escapa los datos procedentes de las listas, protege el reinicio
 contra peticiones de otros sitios y envía cabeceras de seguridad al navegador.
+
+Usa preferentemente `--auth-file /ruta/privada/auth` con un archivo regular del
+usuario que ejecuta el panel, permisos 600 y una línea `usuario:contraseña`.
+Evita pasar contraseñas en argumentos de procesos o historial de comandos.
+`--auth` permanece por compatibilidad. Se admiten credenciales UTF-8.
+
+El servidor limita a 16 conexiones concurrentes y aplica un timeout de lectura
+de cinco segundos. Esto reduce el consumo de recursos, pero no convierte
+`http.server` en un servidor apto para publicar directamente en internet.
+Mantén el panel en loopback y usa un túnel SSH o un acceso autenticado por
+Tailscale; revisa los permisos del tailnet. Para un servicio público, necesitas
+un servidor de producción, HTTPS y límites de solicitudes, además del firewall.
+
+Referencias: [Python HTTP server](https://docs.python.org/3/library/http.server.html),
+[Pi-hole webserver.port](https://docs.pi-hole.net/ftldns/configfile/#port-1),
+[Tailscale y netfilter](https://tailscale.com/kb/1294/firewall-mode),
+[Unbound](https://www.nlnetlabs.nl/documentation/unbound/unbound.conf/).
 
 ## Desinstalar los añadidos
 
