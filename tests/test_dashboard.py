@@ -29,7 +29,8 @@ class DashboardSecurityTests(unittest.TestCase):
         self.assertIn("&lt;b&gt;comprobación&lt;/b&gt;", page)
 
     def test_render_includes_csrf_token(self):
-        page = dashboard.render_html(self.sample_data())
+        with mock.patch.object(dashboard, "ALLOW_RESTART", True):
+            page = dashboard.render_html(self.sample_data())
         self.assertIn('name="csrf_token"', page)
         self.assertIn(dashboard.CSRF_TOKEN, page)
 
@@ -72,6 +73,29 @@ class DashboardSecurityTests(unittest.TestCase):
             ["systemctl"], 0, stdout="active\n", stderr="")
         dashboard.run(["systemctl", "is-active", "unbound"])
         self.assertFalse(run_mock.call_args.kwargs["shell"])
+
+    def test_verify_rejects_additional_public_unbound_interface(self):
+        def output(command):
+            return "127.0.0.1\n0.0.0.0" if "unbound-checkconf" in command else '[ "127.0.0.1#5335" ]'
+        with mock.patch("builtins.open", mock.mock_open(read_data="interface: 127.0.0.1\n")), \
+                mock.patch.object(dashboard, "run", side_effect=output), \
+                mock.patch.object(dashboard, "engine", return_value="pihole"):
+            self.assertFalse(dashboard.verify()["Unbound solo en localhost"])
+
+    def test_verify_rejects_public_fallback_upstream(self):
+        with mock.patch("builtins.open", mock.mock_open(read_data="interface: 127.0.0.1\n")), \
+                mock.patch.object(dashboard, "run", return_value='[ "127.0.0.1#5335", "1.1.1.1" ]'), \
+                mock.patch.object(dashboard, "engine", return_value="pihole"):
+            self.assertFalse(dashboard.verify()["Upstream = Unbound"])
+
+    def test_verify_accepts_only_local_upstream(self):
+        def output(command):
+            return "127.0.0.1\n::1@5335" if "unbound-checkconf" in command else '[ "127.0.0.1#5335" ]'
+        with mock.patch("builtins.open", mock.mock_open(read_data="interface: 127.0.0.1\n")), \
+                mock.patch.object(dashboard, "run", side_effect=output), \
+                mock.patch.object(dashboard, "engine", return_value="pihole"):
+            self.assertTrue(dashboard.verify()["Upstream = Unbound"])
+            self.assertTrue(dashboard.verify()["Unbound solo en localhost"])
 
 
 if __name__ == "__main__":

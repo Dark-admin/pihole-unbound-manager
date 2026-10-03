@@ -15,19 +15,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Instalar ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck nftables
       - name: Validar sintaxis
         run: bash -n nexo-dns.sh
       - name: Ejecutar ShellCheck
-        run: shellcheck -S warning nexo-dns.sh
+        run: shellcheck -S warning nexo-dns.sh tests/test_firewall_namespace.sh
+      - name: Probar firewall real en namespace aislado
+        run: sudo bash tests/test_firewall_namespace.sh
       - name: Probar portadas de ambos motores sin root ni color
         run: |
           NO_COLOR=1 TERM=xterm NEXO_ENGINE=pihole NEXO_LOGO=mini bash nexo-dns.sh banner > /tmp/banner-pihole.txt
           NO_COLOR=1 TERM=xterm NEXO_ENGINE=adguard NEXO_LOGO=mini bash nexo-dns.sh banner > /tmp/banner-adguard.txt
           grep -q "Pi-hole.*Unbound.*Tailscale" /tmp/banner-pihole.txt
           grep -q "AdGuard Home.*Unbound.*Tailscale" /tmp/banner-adguard.txt
-          grep -q "nexo-dns v4.3" /tmp/banner-adguard.txt
-          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.3"
+          grep -q "nexo-dns v4.4" /tmp/banner-adguard.txt
+          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.4"
 
   python:
     name: Python ${{ matrix.python-version }}

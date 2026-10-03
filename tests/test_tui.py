@@ -47,7 +47,7 @@ class TuiBrandTests(unittest.TestCase):
             with self.subTest(layout=layout):
                 result = self.banner("adguard", layout)
                 self.assertEqual(0, result.returncode, result.stderr)
-                self.assertIn("nexo-dns v4.3", result.stdout)
+                self.assertIn("nexo-dns v4.4", result.stdout)
                 self.assert_box_is_aligned(result.stdout)
 
     def test_invalid_engine_override_is_rejected(self):

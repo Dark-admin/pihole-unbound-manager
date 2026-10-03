@@ -2,6 +2,7 @@
 """
 dashboard.py - Panel web para Pi-hole o AdGuard Home + Unbound
 Autor: nexo (Dark)
+v4.4 - Solo lectura por defecto, autenticación privada y conexiones limitadas.
 v4.3 - Identidad visual compartida con el TUI y acento según el motor activo.
 v4.2 - Sigue al motor activo: lee ENGINE de /etc/nexo-dns.conf y saca los
        datos de gravity.db o de AdGuardHome.yaml + querylog.json.
@@ -22,6 +23,10 @@ import html as html_lib
 import ipaddress
 import secrets
 import urllib.parse
+import socket
+import threading
+import stat
+from collections import deque
 from datetime import datetime
 
 # --- Utilidades de sistema ---
@@ -220,7 +225,7 @@ def clients_24h():
         # Se mira solo la cola; recorrerlo entero en una Pi 3 se nota.
         try:
             with open(AGH_LOG, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()[-20000:]
+                lines = deque(f, maxlen=20000)
         except OSError:
             return "?"
         ips = set()
@@ -251,14 +256,11 @@ def verify():
         "dig", "dnssec-failed.org", "@127.0.0.1", "-p", str(uport), "+time=3",
     ])
     # Unbound debe escuchar solo en localhost, no ser un recursivo abierto
-    try:
-        with open(UNBOUND_CONF, encoding="utf-8") as f:
-            localhost_only = any(
-                re.match(r"^\s*interface:\s*127\.0\.0\.1\s*$", line)
-                for line in f
-            )
-    except OSError:
-        localhost_only = False
+    # checkconf también carga los includes; leer un solo fichero podría omitir
+    # una segunda interfaz pública definida en otro fragmento de configuración.
+    interfaces = run(SUDO + ["unbound-checkconf", "-o", "interface"]).split()
+    localhost_only = bool(interfaces) and all(
+        value.split("@", 1)[0] in ("127.0.0.1", "::1") for value in interfaces)
 
     # En pihole.toml v6 el valor va en la linea SIGUIENTE a "upstreams = [",
     # asi que un grep simple nunca lo encuentra. Se usa la API de Pi-hole, y
@@ -266,17 +268,21 @@ def verify():
     # Cada motor apunta a Unbound con su propia sintaxis: Pi-hole usa
     # 127.0.0.1#5335 y AdGuard 127.0.0.1:5335.
     if engine() == "adguard":
-        upstream_ok = "127.0.0.1:{}".format(uport) in agh_block_values(
-            "dns", "upstream_dns")
+        upstream_ok = agh_block_values("dns", "upstream_dns") == [
+            "127.0.0.1:{}".format(uport)]
     else:
         upstream_raw = run(SUDO + ["pihole-FTL", "--config", "dns.upstreams"])
         if not upstream_raw:
             try:
                 with open("/etc/pihole/pihole.toml", encoding="utf-8") as f:
-                    upstream_raw = f.read()
+                    config = f.read()
+                    dns_section = re.search(r"(?ms)^\[dns\]\s*\n(.*?)(?=^\[|\Z)", config)
+                    upstream_match = re.search(r"(?s)\bupstreams\s*=\s*\[(.*?)\]", dns_section[1]) if dns_section else None
+                    upstream_raw = upstream_match[1] if upstream_match else ""
             except OSError:
                 upstream_raw = ""
-        upstream_ok = "127.0.0.1#{}".format(uport) in upstream_raw
+        upstream_ok = re.findall(r'"([^"\n]+)"', upstream_raw) == [
+            "127.0.0.1#{}".format(uport)]
 
     filtro = "AdGuard" if engine() == "adguard" else "Pi-hole"
     return {
@@ -289,8 +295,16 @@ def verify():
     }
 
 def restart():
-    run(SUDO + ["systemctl", "restart", "unbound"])
-    run(SUDO + ["systemctl", "restart", engine_svc()])
+    for service in ("unbound", engine_svc()):
+        try:
+            result = subprocess.run(SUDO + ["systemctl", "restart", service],
+                                    shell=False, capture_output=True, timeout=15,
+                                    check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if result.returncode:
+            return False
+    return True
 
 # --- Recoleccion de datos ---
 def collect():
@@ -403,22 +417,27 @@ def render_html(data):
         '<footer>nexo-dns by nexo (Dark)</footer>'
         '</div></body></html>'
     ).format(
-        CSS, engine_key, data["timestamp"],
+        CSS, engine_key, html_lib.escape(str(data["timestamp"])),
         html_lib.escape(str(data.get("engine_label", "Pi-hole FTL"))),
         pihole_dot, pihole_status,
         unbound_dot, unbound_status,
-        data["gravity"],
-        clients_dot, data["clients"],
+        html_lib.escape(str(data["gravity"])),
+        clients_dot, html_lib.escape(str(data["clients"])),
         hint,
         checks,
         len(data["adlists"]), lists,
         html_lib.escape(CSRF_TOKEN, quote=True),
     )
+    if not ALLOW_RESTART:
+        html = re.sub(r'<section><h2>Acciones</h2>.*?</section>',
+                      '<section><h2>Acceso</h2><p>Panel de solo lectura. Administra los servicios desde el TUI.</p></section>',
+                      html, flags=re.S)
     return html
 
 # --- Autenticacion basica ---
 AUTH_USER = None
 AUTH_PASS = None
+ALLOW_RESTART = False
 CSRF_TOKEN = secrets.token_urlsafe(32)
 
 def check_auth(headers):
@@ -436,8 +455,8 @@ def check_auth(headers):
         # cronometrar respuestas, caracter a caracter.
         # Los dos compare_digest se evaluan siempre —sin cortocircuito— para no
         # filtrar por tiempo si lo que falla es el usuario o la contrasena.
-        ok_user = hmac.compare_digest(user, AUTH_USER)
-        ok_pass = hmac.compare_digest(pwd, AUTH_PASS)
+        ok_user = hmac.compare_digest(user.encode(), AUTH_USER.encode())
+        ok_pass = hmac.compare_digest(pwd.encode(), AUTH_PASS.encode())
         return ok_user & ok_pass
     except Exception:
         return False
@@ -445,10 +464,13 @@ def check_auth(headers):
 def csrf_valid(body):
     """Valida el token de acciones que cambian el sistema."""
     try:
-        token = urllib.parse.parse_qs(body, strict_parsing=True)["csrf_token"][0]
+        tokens = urllib.parse.parse_qs(body, strict_parsing=True)["csrf_token"]
+        if len(tokens) != 1:
+            return False
+        token = tokens[0]
     except (KeyError, ValueError, IndexError):
         return False
-    return hmac.compare_digest(token, CSRF_TOKEN)
+    return hmac.compare_digest(token.encode(), CSRF_TOKEN.encode())
 
 def same_origin(headers):
     """Rechaza peticiones POST enviadas desde otro sitio web."""
@@ -456,7 +478,9 @@ def same_origin(headers):
     if not origin:
         return True
     try:
-        return urllib.parse.urlsplit(origin).netloc == headers.get("Host", "")
+        parsed = urllib.parse.urlsplit(origin)
+        return (parsed.scheme in ("http", "https") and not parsed.username
+                and parsed.netloc == headers.get("Host", ""))
     except ValueError:
         return False
 
@@ -469,7 +493,75 @@ def is_loopback_host(host):
         return False
 
 # --- Servidor HTTP ---
+class BoundedHTTPServer(http.server.ThreadingHTTPServer):
+    """Panel privado: acota conexiones y tiempo de lectura; no servidor público."""
+    daemon_threads = True
+    request_queue_size = 16
+
+    def __init__(self, address, handler, max_connections=16):
+        self.slots = threading.BoundedSemaphore(max_connections)
+        self.allowed_hosts = {address[0].lower()}
+        if is_loopback_host(address[0]):
+            self.allowed_hosts.update({"localhost", "127.0.0.1", "::1"})
+        if ":" in address[0]:
+            self.address_family = socket.AF_INET6
+        super().__init__(address, handler)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(5)
+        return connection, address
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+def read_auth_file(path):
+    """Credenciales fuera de argv; fichero regular, privado y del usuario actual."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, encoding="utf-8") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+            raise ValueError("El archivo de autenticación debe tener permisos 600")
+        if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+            raise ValueError("El archivo debe pertenecer al usuario que ejecuta el panel")
+        value = source.read(4097).rstrip("\r\n")
+        if len(value) > 4096 or "\n" in value or ":" not in value:
+            raise ValueError("Formato de autenticación no válido")
+        user, password = value.split(":", 1)
+        if not user or not password:
+            raise ValueError("Usuario y contraseña no pueden estar vacíos")
+        return user, password
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "nexo-dns"
+    sys_version = ""
+
+    def trusted_host(self):
+        # Evita DNS rebinding: Origin no basta si el Host también es del atacante.
+        try:
+            authority = urllib.parse.urlsplit("//" + self.headers.get("Host", ""))
+            return (not authority.username and not authority.password
+                    and not authority.path and not authority.query and not authority.fragment
+                    and authority.hostname in self.server.allowed_hosts
+                    and authority.port in (None, self.server.server_port))
+        except ValueError:
+            return False
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", (
@@ -487,6 +579,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if not self.trusted_host():
+            self.send_error(403, "Host no autorizado")
+            return
         if not check_auth(self.headers):
             self._deny()
             return
@@ -510,6 +605,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "/")
             self.end_headers()
             return
+        if self.path != "/":
+            self.send_error(404)
+            return
         data = collect()
         html = render_html(data)
         self.send_response(200)
@@ -518,10 +616,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(html.encode())
 
     def do_POST(self):
+        if not self.trusted_host():
+            self.send_error(403, "Host no autorizado")
+            return
         if not check_auth(self.headers):
             self._deny()
             return
         if self.path == "/restart":
+            if not ALLOW_RESTART:
+                self.send_error(403, "Panel de solo lectura")
+                return
+            if self.headers.get("Transfer-Encoding"):
+                self.send_error(400, "Solicitud no valida")
+                return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -537,7 +644,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not same_origin(self.headers) or not csrf_valid(body):
                 self.send_error(403, "Solicitud rechazada")
                 return
-            restart()
+            if not restart():
+                self.send_error(503, "No se pudo reiniciar; revisa los servicios desde el TUI")
+                return
             self.send_response(302)
             self.send_header("Location", "/")
             self.end_headers()
@@ -553,30 +662,47 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
     ap.add_argument("--port", type=int, default=8080, help="Puerto (default: 8080)")
     ap.add_argument("--auth", help="Autenticacion basica: usuario:password")
+    ap.add_argument("--auth-file", help="Archivo privado (600) con usuario:contraseña")
+    ap.add_argument("--allowed-host", action="append", default=[], help="Nombre DNS o IP autorizado en Host; repetible")
+    ap.add_argument("--allow-restart", action="store_true", help="Habilita reinicios (por defecto: solo lectura)")
     ap.add_argument(
         "--allow-unauthenticated", action="store_true",
         help="Permite escuchar fuera de localhost sin autenticacion (peligroso)",
     )
     args = ap.parse_args()
 
-    global AUTH_USER, AUTH_PASS
+    global AUTH_USER, AUTH_PASS, ALLOW_RESTART
+    ALLOW_RESTART = args.allow_restart
+    if not 1 <= args.port <= 65535:
+        ap.error("Puerto fuera de rango")
+    if args.host in ("0.0.0.0", "::") and not args.allowed_host:
+        ap.error("Una escucha global exige --allowed-host con la IP o nombre usado para acceder")
+    if args.auth and args.auth_file:
+        ap.error("Usa --auth o --auth-file, no ambos")
+    if args.auth_file:
+        try:
+            AUTH_USER, AUTH_PASS = read_auth_file(args.auth_file)
+        except (OSError, ValueError):
+            ap.error("Archivo de autenticación inválido: debe ser privado, propio y contener usuario:contraseña")
     if args.auth:
         if ":" not in args.auth:
             print("Error: --auth debe ser usuario:password")
             sys.exit(1)
         AUTH_USER, AUTH_PASS = args.auth.split(":", 1)
+        if not AUTH_USER or not AUTH_PASS:
+            ap.error("Usuario y contraseña no pueden estar vacíos")
         print("Autenticacion basica habilitada para el usuario: {}".format(AUTH_USER))
-    elif not is_loopback_host(args.host) and not args.allow_unauthenticated:
+    if AUTH_USER is None and not is_loopback_host(args.host) and not args.allow_unauthenticated:
         print("Error: el panel no se expondra a la red sin autenticacion.")
-        print("       Usa --auth usuario:password o, bajo tu responsabilidad,")
+        print("       Usa --auth-file /ruta/privada/auth o, bajo tu responsabilidad,")
         print("       --allow-unauthenticated.")
         sys.exit(2)
 
     if not is_loopback_host(args.host):
         print("AVISO: Basic Auth no cifra el trafico. Usa Tailscale o un proxy HTTPS.")
 
-    http.server.ThreadingHTTPServer.allow_reuse_address = True
-    with http.server.ThreadingHTTPServer((args.host, args.port), Handler) as httpd:
+    with BoundedHTTPServer((args.host, args.port), Handler) as httpd:
+        httpd.allowed_hosts.update(value.lower() for value in args.allowed_host)
         print("Dashboard en http://{}:{}".format(args.host, args.port))
         if args.host == "0.0.0.0":
             print("  Accede desde: http://<IP-del-servidor>:{}".format(args.port))

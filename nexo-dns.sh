@@ -3,7 +3,7 @@
 #  nexo-dns.sh — Instalador y panel de DNS privado
 #  Pi-hole o AdGuard Home + Unbound + Tailscale
 #
-#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.3
+#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.4
 #  Compatible: Raspberry Pi OS · Debian 11+ · Ubuntu 20.04+ · VPS
 #
 #  Uso:
@@ -11,6 +11,7 @@
 #     sudo bash nexo-dns.sh install      → instalación completa
 #     sudo bash nexo-dns.sh status       → estado
 #     sudo bash nexo-dns.sh health       → chequeo con pruebas reales
+#     sudo bash nexo-dns.sh audit        → auditoría de seguridad sin cambios
 #     sudo bash nexo-dns.sh optimize     → reaplica la optimización
 #     sudo bash nexo-dns.sh security     → qué hay expuesto a internet
 #     sudo bash nexo-dns.sh firewall     → cierra el DNS al mundo
@@ -37,7 +38,7 @@ fi
 
 # OJO: no llamarla VERSION. /etc/os-release define VERSION y al leerlo
 # machacaría la nuestra ("nexo-dns v13 (trixie)").
-NEXO_VERSION="4.3"
+NEXO_VERSION="4.4"
 CONF=/etc/nexo-dns.conf
 UNBOUND_CONF=/etc/unbound/unbound.conf.d/pi-hole.conf
 PIHOLE_TOML=/etc/pihole/pihole.toml
@@ -636,10 +637,10 @@ cpu_temp() {
 IS_VPS=0; PLATFORM=""
 detect_platform() {
   local virt vendor
-  # Una Raspberry o un mini-PC en casa: hardware físico, no hay más que mirar.
+  # Detecta el hardware y después comprueba las direcciones, incluida IPv6.
   if [[ -r /proc/device-tree/model ]]; then
-    PLATFORM="$MODEL"; IS_VPS=0; return
-  fi
+    PLATFORM="$MODEL"; IS_VPS=0
+  else
   vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)
   case "$vendor" in
     *Amazon*)       PLATFORM="Amazon EC2"   ; IS_VPS=1 ;;
@@ -655,10 +656,17 @@ detect_platform() {
       if [[ "$virt" != none ]]; then PLATFORM="virtualizado ($virt)"; IS_VPS=1
       else PLATFORM="${MODEL:-hardware físico}"; IS_VPS=0; fi ;;
   esac
+  fi
   # Una IP pública directa en la interfaz zanja la duda: esto da a internet.
   local a
-  a=$(ip -4 -br addr show scope global 2>/dev/null | awk 'NR==1{sub(/\/.*/,"",$3); print $3}')
-  if [[ -n "$a" ]] && ! is_private_ip "$a"; then IS_VPS=1; fi
+  while read -r a; do
+    [[ -n "$a" ]] && ! is_private_ip "$a" && IS_VPS=1
+  done < <(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')
+  # Una Pi también puede tener IPv6 pública; el hardware no determina exposición.
+  if ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}' | grep -Eq '^[23][0-9a-fA-F]{3}:'; then
+    IS_VPS=1
+  fi
+  return 0
 }
 
 is_private_ip() {
@@ -931,7 +939,7 @@ backup_now() {
 }
 
 # ══════════════════════════════════════════════════════════ validaciones ═══════
-valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 valid_ip() {
   [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   awk -F. '{for(i=1;i<=4;i++) if($i>255) exit 1}' <<<"$1"
@@ -1151,7 +1159,7 @@ apply_unbound() {
   systemctl restart unbound || { restore_unbound "$bkdir"; return 1; }
   sleep 3
   systemctl is-active --quiet unbound || { err "Unbound no arranca"; restore_unbound "$bkdir"; return 1; }
-  dig +short +time=5 +tries=2 google.com @127.0.0.1 -p "$UNBOUND_PORT" >/dev/null 2>&1 \
+  dns_healthy "$UNBOUND_PORT" \
     || { err "Unbound no resuelve en el puerto $UNBOUND_PORT"; restore_unbound "$bkdir"; return 1; }
 
   local ad bad
@@ -1453,6 +1461,17 @@ switch_engine() {
   yes_no "¿Cambiar a $tgt_n?" || return 0
 
   local old_svc new_svc
+  if fw_active; then
+    engine_fw_ports || { pause; return 1; }
+    FW_PENDING_TCP="$FW_TCP"; FW_PENDING_UDP="$FW_UDP"
+    ENGINE="$target"
+    if ! install_firewall_quiet; then
+      ENGINE="$prev"; FW_PENDING_TCP=""; FW_PENDING_UDP=""
+      err "No se pudo proteger el motor nuevo; no se detiene el actual"
+      pause; return 1
+    fi
+    ENGINE="$prev"; FW_PENDING_TCP=""; FW_PENDING_UDP=""
+  fi
   old_svc=$(engine_svc); ENGINE="$target"; new_svc=$(engine_svc)
   stop_engine_svc "$old_svc"
   systemctl enable --now "$new_svc" >/dev/null 2>&1 || systemctl start "$new_svc" >/dev/null 2>&1
@@ -1460,7 +1479,7 @@ switch_engine() {
 
   # Verificación real: quedarse sin DNS deja la casa entera sin internet, así
   # que si el motor nuevo no resuelve se vuelve al anterior sin preguntar.
-  if dig +short +time=5 +tries=2 google.com @127.0.0.1 -p "$PIHOLE_PORT" >/dev/null 2>&1; then
+  if dns_healthy "$PIHOLE_PORT"; then
     load_conf; ENGINE="$target"; save_conf
     ok "Motor activo: $tgt_n"
     configure_engine || warn "Revisa la configuración: panel → Reoptimizar"
@@ -1475,7 +1494,7 @@ switch_engine() {
     ENGINE="$prev"
     systemctl enable --now "$old_svc" >/dev/null 2>&1 || systemctl start "$old_svc" >/dev/null 2>&1
     sleep 2
-    if dig +short +time=5 google.com @127.0.0.1 -p "$PIHOLE_PORT" >/dev/null 2>&1; then
+    if dns_healthy "$PIHOLE_PORT"; then
       ok "$cur_n restaurado y resolviendo"
     else
       err "Ninguno de los dos resuelve. Revisa: systemctl status $old_svc"
@@ -1687,6 +1706,7 @@ change_unbound_port() {
     err "El puerto $np ya lo usa otro proceso:"; ss -tulpn 2>/dev/null | grep ":$np " | sed 's/^/    /'
     pause; return
   fi
+  fw_prepare_port_change "$np" udp || { pause; return 1; }
   local bk; bk=$(backup_now); info "Copia en $bk"
   sed -i "s/^\(\s*\)port:.*/\1port: $np/" "$UNBOUND_CONF"
   local old="$UNBOUND_PORT"; UNBOUND_PORT="$np"
@@ -1708,7 +1728,7 @@ change_unbound_port() {
         UNBOUND_PORT="$old"; restore_engine "$bk"; restore_unbound "$bk"
         pause; return
       fi
-      if dig +short +time=5 google.com @127.0.0.1 -p "$PIHOLE_PORT" >/dev/null 2>&1; then
+      if dns_healthy "$PIHOLE_PORT"; then
         save_conf; ok "Unbound movido del $old al $np y $ENAME apuntando ahí"
       else
         err "$ENAME dejó de resolver; revirtiendo"
@@ -1751,10 +1771,11 @@ change_pihole_port() {
     err "El puerto $np ya está ocupado:"; ss -tulpn 2>/dev/null | grep ":$np " | sed 's/^/    /'
     pause; return
   fi
+  fw_prepare_port_change "$np" udp || { pause; return 1; }
   local old="$PIHOLE_PORT"; backup_now >/dev/null
   engine_set_dns_port "$np" || { err "No se pudo aplicar el cambio"; pause; return; }
   sleep 3
-  if dig +short +time=5 google.com @127.0.0.1 -p "$np" >/dev/null 2>&1; then
+  if dns_healthy "$np"; then
     PIHOLE_PORT="$np"; save_conf; ok "$ENAME escuchando en el $np"
   else
     err "No responde en el $np; volviendo al $old"
@@ -1782,6 +1803,7 @@ change_web_port() {
       err "El puerto $anp ya está ocupado:"; ss -tulpn 2>/dev/null | grep ":$anp " | sed 's/^/    /'
       pause; return
     fi
+    fw_prepare_port_change "$anp" tcp || { pause; return 1; }
     aold="$WEB_PORT"
     backup_now >/dev/null
     systemctl stop "$AGH_SVC" 2>/dev/null || true
@@ -1835,6 +1857,7 @@ change_web_port() {
     }' "${cur:-$WEB_PORT}")
   [[ -z "$new" ]] && new="$np,[::]:$np"
 
+  fw_prepare_port_change "$np" tcp || { pause; return 1; }
   local bk; bk=$(backup_now); info "Copia en $bk"
   echo "  ${DIM}$cur${NC}  →  ${BLD}$new${NC}"
   ph_set webserver.port "$new" || { pause; return; }
@@ -1912,10 +1935,11 @@ change_ip() {
   warn "Se aplica en 5 segundos. Aquí se corta la sesión."
   sleep 5
   # Desacoplado del SSH: el cambio termina aunque el terminal muera a mitad.
-  setsid nohup bash -c "
-    nmcli con mod '$con' ipv4.method manual ipv4.addresses '$nip/$cidr' ipv4.gateway '$gw'
-    nmcli con up '$con'
-  " >/var/log/nexo-dns-ipchange.log 2>&1 &
+  # Los nombres de conexiones son datos: nunca interpolarlos en código root.
+  setsid nohup bash -c '
+    nmcli con mod "$1" ipv4.method manual ipv4.addresses "$2" ipv4.gateway "$3" &&
+    nmcli con up "$1"
+  ' nexo-ipchange "$con" "$nip/$cidr" "$gw" >/var/log/nexo-dns-ipchange.log 2>&1 &
   LISTEN_IP="$nip"; save_conf
   echo; ok "Lanzado. Reconecta con:  ssh usuario@$nip"
   echo "  Registro: /var/log/nexo-dns-ipchange.log"
@@ -2042,8 +2066,7 @@ EOF
       warn "Ojo: esta máquina es pública ($PLATFORM). Poner ALL sin cortafuegos"
       warn "la convierte en un resolver abierto. Primero pon el cortafuegos"
       warn "(panel → Seguridad) y luego vuelve aquí."
-      yes_no "¿Poner ALL de todas formas?" \
-        && { ph_set dns.listeningMode ALL; systemctl restart pihole-FTL; }
+      err "No se activa ALL en una máquina pública sin la protección del DNS"
     else
       yes_no "¿Lo pongo en ALL?" && { ph_set dns.listeningMode ALL; systemctl restart pihole-FTL; }
     fi
@@ -2503,8 +2526,70 @@ backups_menu() {
 }
 
 # ═══════════════════════════════════════════════════════════ SEGURIDAD ═════════
+security_audit() {
+  step "Auditoría de seguridad (solo lectura)"
+  local failures=0 warnings=0 value interface service
+  service=$(engine_svc)
+  if systemctl is-active --quiet unbound && systemctl is-active --quiet "$service"; then
+    ok "Servicios DNS activos"
+  else err "Algún servicio DNS no está activo"; failures=$((failures+1)); fi
+  if dns_healthy "$PIHOLE_PORT" && dns_healthy "$UNBOUND_PORT"; then
+    ok "Filtro y Unbound responden con registros válidos"
+  else err "Resolución DNS fallida"; failures=$((failures+1)); fi
+  if need unbound-checkconf; then
+    value=$(unbound-checkconf -o interface 2>/dev/null) || value=""
+    if [[ -z "$value" ]]; then
+      warn "No se pudieron verificar las interfaces efectivas de Unbound"; warnings=$((warnings+1))
+    else
+      local exposed=0
+      for interface in $value; do
+        case "$interface" in 127.0.0.1|::1|127.0.0.1@*|::1@*) ;; *) exposed=1 ;; esac
+      done
+      if (( exposed )); then err "Unbound tiene interfaces fuera de loopback"; failures=$((failures+1))
+      else ok "Interfaces efectivas de Unbound limitadas a loopback"; fi
+    fi
+  else warn "Falta unbound-checkconf"; warnings=$((warnings+1)); fi
+  if fw_active; then
+    ok "Tabla de firewall propia cargada"
+    if systemctl is-enabled --quiet nexo-dns-firewall.service; then ok "Carga al arrancar habilitada"
+    else warn "El firewall no está habilitado al arrancar"; warnings=$((warnings+1)); fi
+    warn "Presencia de tabla no demuestra cobertura: revisa HTTPS y prueba desde otra red"
+    warnings=$((warnings+1))
+  else err "No hay firewall propio de DNS cargado"; failures=$((failures+1)); fi
+  if need sshd; then
+    value=$(sshd -T 2>/dev/null) || value=""
+    if grep -q '^passwordauthentication yes$' <<<"$value"; then
+      warn "SSH permite contraseñas: migra a claves probadas antes de restringirlo"; warnings=$((warnings+1))
+    fi
+    if grep -q '^permitrootlogin yes$' <<<"$value"; then
+      warn "SSH permite acceso directo de root"; warnings=$((warnings+1))
+    fi
+    [[ -n "$value" ]] || { warn "No se pudo verificar SSH"; warnings=$((warnings+1)); }
+  fi
+  if need apt; then
+    value=$(apt list --upgradable 2>/dev/null | awk 'NR>1{n++} END{print n+0}')
+    info "Paquetes actualizables según índices locales: $value (sin actualizar ni instalar)"
+  fi
+  info "No se prueban exploits ni DoS. Router, IPv6 pública y permisos Tailscale requieren verificación externa"
+  info "Resultado: $failures fallo(s), $warnings advertencia(s). No equivale a una certificación de seguridad"
+  (( failures == 0 ))
+}
+
 FW_NFT=/etc/nexo-dns-firewall.nft
 FW_UNIT=/etc/systemd/system/nexo-dns-firewall.service
+FW_TRUST_CONF=/etc/nexo-dns-trusted.conf
+FW_PENDING_TCP=""; FW_PENDING_UDP=""
+
+fw_prepare_port_change() {
+  fw_active || return 0
+  FW_PENDING_TCP="$1"
+  [[ "$2" != udp ]] || FW_PENDING_UDP="$1"
+  local result=0
+  install_firewall_quiet || result=1
+  FW_PENDING_TCP=""; FW_PENDING_UDP=""
+  (( result == 0 )) || err "No se puede proteger el puerto nuevo: cambio cancelado"
+  return "$result"
+}
 
 fw_active() { nft list table inet nexo_dns >/dev/null 2>&1; }
 
@@ -2517,18 +2602,68 @@ fw_active() { nft list table inet nexo_dns >/dev/null 2>&1; }
 # el panel al puerto elegido —que ya es WEB_PORT— y el 3000 deja de escuchar:
 # cerrarlo siempre sería cerrar un puerto que no usa nadie.
 FW_TCP=""; FW_UDP=""; FW_EXTRA=""
+fw_port_list() {
+  local p
+  for p in "$@"; do
+    valid_port "$p" || { err "Puerto de firewall inválido: $p" >&2; return 1; }
+    printf '%s\n' "$((10#$p))"
+  done | sort -nu | paste -sd, -
+}
+
+pihole_web_ports() {
+  local raw token p
+  raw=$(ph_get webserver.port)
+  raw=${raw//\"/}
+  if [[ -z "$raw" ]]; then
+    # Sin lectura fiable, cubre puertos normales y de respaldo; no afirma detectarlos.
+    printf '%s\n' "$WEB_PORT" 80 443 8080 8443
+    return
+  fi
+  raw=${raw//,/ }
+  for token in $raw; do
+    # CivetWeb acepta 80o, 443os, [::]:443s y dirección:puerto.
+    token=${token##*:}
+    if [[ "$token" =~ ^([0-9]+)[ors]*$ ]]; then
+      p=${BASH_REMATCH[1]}
+      valid_port "$p" || return 1
+      printf '%s\n' "$p"
+    else
+      err "Formato webserver.port no reconocido" >&2
+      return 1
+    fi
+  done
+}
+
 engine_fw_ports() {
   FW_TCP="$PIHOLE_PORT, $UNBOUND_PORT, $WEB_PORT"
   FW_UDP="$PIHOLE_PORT, $UNBOUND_PORT"
   FW_EXTRA=""
-  [[ "$ENGINE" == adguard && -f "$AGH_YAML" ]] || return 0
+  if [[ "$ENGINE" == pihole ]]; then
+    local web p
+    web=$(pihole_web_ports) || return 1
+    local -a ports=("$PIHOLE_PORT" "$UNBOUND_PORT" "$WEB_PORT" 8080)
+    while read -r p; do [[ -n "$p" ]] && ports+=("$p"); done <<<"$web"
+    FW_TCP=$(fw_port_list "${ports[@]}") || return 1
+    FW_UDP=$(fw_port_list "$PIHOLE_PORT" "$UNBOUND_PORT") || return 1
+    FW_EXTRA="TCP $FW_TCP (incluye HTTPS y panel opcional 8080)"
+    return 0
+  fi
+  if [[ "$ENGINE" != adguard || ! -f "$AGH_YAML" ]]; then
+    err "No se puede leer la configuración del motor activo; no se aplica el firewall"
+    return 1
+  fi
+  local agh_dns agh_web
+  agh_dns=$(agh_get dns port)
+  agh_web=$(agh_get http address); agh_web=${agh_web##*:}
+  valid_port "$agh_dns" && FW_UDP="$FW_UDP, $agh_dns" && FW_TCP="$FW_TCP, $agh_dns"
+  valid_port "$agh_web" && FW_TCP="$FW_TCP, $agh_web"
 
   local tcp="" udp="" v
   (( AGH_READY )) || tcp="3000"
   if [[ "$(agh_get tls enabled)" == "true" ]]; then
     for v in port_https port_dns_over_tls; do
       local p; p=$(agh_get tls "$v")
-      [[ "$p" =~ ^[0-9]+$ ]] && (( p > 0 )) && tcp="${tcp:+$tcp, }$p"
+      valid_port "$p" && tcp="${tcp:+$tcp, }$p"
     done
     local q; q=$(agh_get tls port_dns_over_quic)
     [[ "$q" =~ ^[0-9]+$ ]] && (( q > 0 )) && udp="${udp:+$udp, }$q"
@@ -2539,7 +2674,51 @@ engine_fw_ports() {
   fi
   [[ -n "$tcp" ]] && { FW_TCP="$FW_TCP, $tcp"; FW_EXTRA="TCP $tcp"; }
   [[ -n "$udp" ]] && { FW_UDP="$FW_UDP, $udp"; FW_EXTRA="${FW_EXTRA:+$FW_EXTRA · }UDP $udp"; }
+  FW_TCP="$FW_TCP, 8080"
+  local -a tports uports
+  read -ra tports <<<"${FW_TCP//,/ }"
+  read -ra uports <<<"${FW_UDP//,/ }"
+  FW_TCP=$(fw_port_list "${tports[@]}") || return 1
+  FW_UDP=$(fw_port_list "${uports[@]}") || return 1
   return 0
+}
+
+fw_trusted_networks() {
+  # Lista explícita opcional, nunca source: un dato no puede ejecutar órdenes root.
+  FW_V4=""; FW_V6="fe80::/10"
+  local key value net addr prefix
+  if [[ -f "$FW_TRUST_CONF" ]]; then
+    while IFS='=' read -r key value; do
+      case "$key" in IPV4) FW_V4="$value" ;; IPV6) FW_V6="$value" ;; esac
+    done < "$FW_TRUST_CONF"
+  else
+    while read -r net; do
+      addr=${net%/*}
+      is_private_ip "$addr" || continue
+      [[ "$addr" == 100.* || "$addr" == 127.* ]] && continue
+      FW_V4="${FW_V4:+$FW_V4, }$net"
+    done < <(ip -4 route show scope link 2>/dev/null | awk '$2=="dev" && $3!="tailscale0" {print $1}')
+  fi
+  local -a nets
+  read -ra nets <<<"${FW_V4//,/ }"
+  for net in "${nets[@]}"; do
+    addr=${net%/*}; prefix=${net##*/}
+    valid_ip "$addr" && [[ "$net" == */* && "$prefix" =~ ^[0-9]{1,2}$ ]] && (( 10#$prefix >= 1 && 10#$prefix <= 32 )) \
+      || { err "Red IPv4 de confianza inválida"; return 1; }
+  done
+  read -ra nets <<<"${FW_V6//,/ }"
+  for net in "${nets[@]}"; do
+    [[ "$net" =~ ^[0-9a-fA-F:]+/[0-9]{1,3}$ ]] || { err "Red IPv6 de confianza inválida"; return 1; }
+    prefix=${net##*/}
+    (( 10#$prefix >= 1 && 10#$prefix <= 128 )) || return 1
+  done
+}
+
+dns_healthy() {
+  # dig puede devolver código cero con SERVFAIL: exige NOERROR y una respuesta A.
+  local answer
+  answer=$(dig +time=5 +tries=1 +noall +comments +answer "${2:-example.com}" A @127.0.0.1 -p "$1" 2>/dev/null) || return 1
+  grep -q 'status: NOERROR' <<<"$answer" && awk '$4=="A" && $5 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {ok=1} END {exit !ok}' <<<"$answer"
 }
 
 # La IP pública se pregunta por DNS, no por HTTP: es una consulta normal a
@@ -2613,9 +2792,18 @@ show_exposure() {
       warn "Sin reglas propias. En una VPS pública conviene poner el DNS"
       warn "a resguardo (opción 2)."
     else
-      info "Sin reglas propias (en una red doméstica no suele hacer falta)"
+      warn "Sin reglas propias: revisar router, IPv6, reenvíos y acceso por VPN"
     fi
   fi
+  echo
+  echo "  ${BLD}Acceso administrativo (diagnóstico, sin modificar SSH)${NC}"
+  if need sshd; then
+    sshd -T 2>/dev/null | awk '$1 ~ /^(port|permitrootlogin|passwordauthentication|pubkeyauthentication|allowtcpforwarding|disableforwarding)$/ {print "    " $0}'
+  fi
+  warn "SSH y otros servicios no están restringidos por este firewall de DNS"
+  info "Para administrar desde internet: Tailscale con permisos limitados o túnel SSH"
+  info "No publiques el panel ni un DNS recursivo mediante reenvíos o DMZ"
+  info "Una coincidencia CVE por versión requiere contrastar el paquete y parches de Debian"
   pause
 }
 
@@ -2626,7 +2814,8 @@ install_firewall() {
     yes_no "¿Lo instalo?" || { pause; return; }
     apt-get install -y nftables || { err "No se pudo instalar"; pause; return; }
   }
-  engine_fw_ports
+  engine_fw_ports || { pause; return 1; }
+  fw_trusted_networks || { pause; return 1; }
   echo
   echo "  Se cierra el DNS ($PIHOLE_PORT) y el panel web ($WEB_PORT) a internet,"
   if [[ -n "$FW_EXTRA" ]]; then
@@ -2635,12 +2824,13 @@ install_firewall() {
   fi
   echo "  dejándolos abiertos solo para:"
   echo "    · la propia máquina (loopback)"
-  echo "    · redes privadas: 10/8, 172.16/12, 192.168/16"
-  echo "    · el tailnet de Tailscale: 100.64/10"
+  echo "    · IPv4 conectada o explícita: ${FW_V4:-ninguna}"
+  echo "    · IPv6 explícita: ${FW_V6:-ninguna}"
+  echo "    · interfaz tailscale0, sujeta a permisos del tailnet"
   echo
   echo "  ${BLD}El SSH no se toca.${NC} La política de la cadena es ${BLD}accept${NC} y solo"
   echo "  se descartan esos puertos concretos, así que esto ${BLD}no puede${NC}"
-  echo "  dejarte fuera de la máquina."
+  echo "  restringir el puerto SSH habitual; no sustituye un firewall general."
   echo
   yes_no "¿Aplicar?" || { pause; return; }
   install_firewall_quiet
@@ -2657,11 +2847,32 @@ install_firewall() {
 # se queda cerrando los del motor anterior.
 install_firewall_quiet() {
   need nft || return 1
-  engine_fw_ports
+  engine_fw_ports || return 1
+  local -a tcp_ports udp_ports
+  read -ra tcp_ports <<<"${FW_TCP//,/ } ${FW_PENDING_TCP//,/ }"
+  read -ra udp_ports <<<"${FW_UDP//,/ } ${FW_PENDING_UDP//,/ }"
+  FW_TCP=$(fw_port_list "${tcp_ports[@]}") || return 1
+  FW_UDP=$(fw_port_list "${udp_ports[@]}") || return 1
+  fw_trusted_networks || return 1
+  # Evita cerrar un SSH que el usuario haya movido a un puerto del panel.
+  local sshport
+  while read -r sshport; do
+    case ",$FW_TCP," in *",$sshport,"*) err "Puerto $sshport compartido con SSH: corrige el conflicto antes"; return 1 ;; esac
+  done < <({ printf '22\n'; sshd -T 2>/dev/null | awk '$1=="port" {print $2}'; } | sort -u)
+  dns_healthy "$PIHOLE_PORT" || { err "El DNS ya falla antes del cambio; no se modifica el firewall"; return 1; }
+  install -d -m 700 "$BACKUP_ROOT" || return 1
+  local bk candidate nftbin
+  bk=$(mktemp -d "$BACKUP_ROOT/firewall.XXXXXXXX") || return 1
+  candidate="$bk/candidate.nft"
+  [[ ! -f "$FW_NFT" ]] || cp -a "$FW_NFT" "$bk/previous.nft"
+  [[ ! -f "$FW_UNIT" ]] || cp -a "$FW_UNIT" "$bk/previous.service"
+  systemctl is-enabled --quiet nexo-dns-firewall.service 2>/dev/null && touch "$bk/enabled"
+  systemctl is-active --quiet nexo-dns-firewall.service 2>/dev/null && touch "$bk/active"
+  { printf 'table inet nexo_dns\ndelete table inet nexo_dns\n'; nft -s list table inet nexo_dns 2>/dev/null || true; } > "$bk/rollback.nft"
 
   # `table` antes de `delete` crea la tabla si no existe: así el delete nunca
   # falla en la primera ejecución y el fichero es idempotente.
-  cat > "$FW_NFT" <<EOF
+  cat > "$candidate" <<EOF
 #!/usr/sbin/nft -f
 # Generado por nexo-dns.sh v$NEXO_VERSION el $(date '+%Y-%m-%d %H:%M')
 # Cierra el DNS y el panel web a internet. No toca el SSH ni nada más.
@@ -2669,36 +2880,40 @@ table inet nexo_dns
 delete table inet nexo_dns
 
 table inet nexo_dns {
-    set confiables {
-        type ipv4_addr
-        flags interval
-        elements = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }
-    }
     chain input {
         type filter hook input priority -10; policy accept;
         iif lo accept
-        ip saddr @confiables accept
-        ip6 saddr { fd00::/8, fe80::/10 } accept
-        udp dport { $FW_UDP } drop
-        tcp dport { $FW_TCP } drop
+        iifname "tailscale0" accept
+$( [[ -z "$FW_V4" ]] || printf '        ip saddr { %s } accept\n' "$FW_V4" )
+$( [[ -z "$FW_V6" ]] || printf '        ip6 saddr { %s } accept\n' "$FW_V6" )
+        udp dport { $FW_UDP } counter drop
+        tcp dport { $FW_TCP } counter drop
     }
 }
 EOF
-  chmod 644 "$FW_NFT"
+  chmod 600 "$candidate"
 
-  if ! nft -c -f "$FW_NFT" 2>/dev/null; then
-    err "Las reglas no son válidas:"; nft -c -f "$FW_NFT" 2>&1 | sed 's/^/    /'
-    rm -f "$FW_NFT"; return 1
+  if ! nft -c -f "$candidate" 2>/dev/null; then
+    err "Las reglas no son válidas:"; nft -c -f "$candidate" 2>&1 | sed 's/^/    /'
+    return 1
   fi
-  nft -f "$FW_NFT" || { err "No se pudieron cargar"; return 1; }
+  nft -f "$candidate" || { err "No se pudieron cargar; se conserva el estado previo"; return 1; }
+  if ! dns_healthy "$PIHOLE_PORT"; then
+    err "El DNS falló: restaurando la tabla previa"
+    nft -f "$bk/rollback.nft" || err "RESTAURACIÓN FALLIDA: usa $bk/rollback.nft desde consola"
+    return 1
+  fi
   ok "Reglas cargadas · TCP {$FW_TCP} · UDP {$FW_UDP}"
 
-  local nftbin; nftbin=$(command -v nft)
-  cat > "$FW_UNIT" <<EOF
+  nftbin=$(command -v nft)
+  cat > "$bk/candidate.service" <<EOF
 [Unit]
 Description=Cortafuegos del DNS de nexo-dns
-After=network-pre.target
+DefaultDependencies=no
+After=local-fs.target nftables.service
+Before=network-pre.target shutdown.target
 Wants=network-pre.target
+Conflicts=shutdown.target
 
 [Service]
 Type=oneshot
@@ -2709,19 +2924,25 @@ ExecStop=$nftbin delete table inet nexo_dns
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable nexo-dns-firewall.service >/dev/null 2>&1 && ok "Se reaplica en cada arranque"
-
-  # Comprobación real: desde la propia máquina se tiene que seguir resolviendo.
-  sleep 1
-  if dig +short +time=5 google.com @127.0.0.1 -p "$PIHOLE_PORT" >/dev/null 2>&1; then
-    ok "El DNS sigue funcionando desde la máquina"
+  if install -m 600 "$candidate" "$FW_NFT" && install -m 644 "$bk/candidate.service" "$FW_UNIT" \
+      && systemctl daemon-reload && systemctl enable --now nexo-dns-firewall.service \
+      && systemctl is-active --quiet nexo-dns-firewall.service && dns_healthy "$PIHOLE_PORT"; then
+    ok "DNS comprobado; servicio activo y habilitado. Respaldo: $bk"
     return 0
   else
-    err "El DNS ha dejado de responder — quitando las reglas"
-    nft delete table inet nexo_dns 2>/dev/null || true
-    systemctl disable nexo-dns-firewall.service >/dev/null 2>&1 || true
-    rm -f "$FW_NFT" "$FW_UNIT"; systemctl daemon-reload
+    err "Falló la persistencia o la comprobación: restaurando el estado anterior"
+    # Una primera instalación fallida no debe dejar un servicio activo huérfano.
+    if [[ ! -f "$bk/active" ]]; then
+      systemctl stop nexo-dns-firewall.service >/dev/null 2>&1 || true
+    fi
+    if [[ -f "$bk/previous.nft" ]]; then cp -a "$bk/previous.nft" "$FW_NFT"; else rm -f "$FW_NFT"; fi
+    if [[ -f "$bk/previous.service" ]]; then cp -a "$bk/previous.service" "$FW_UNIT"; else rm -f "$FW_UNIT"; fi
+    [[ -f "$bk/enabled" ]] || systemctl disable nexo-dns-firewall.service >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    if [[ -f "$bk/active" ]]; then
+      systemctl start nexo-dns-firewall.service >/dev/null 2>&1 || warn "No se pudo reactivar el servicio previo"
+    fi
+    nft -f "$bk/rollback.nft" || err "RESTAURACIÓN FALLIDA: usa $bk/rollback.nft desde consola"
     return 1
   fi
 }
@@ -2745,6 +2966,7 @@ security_menu() {
     echo "    1) Ver exposición a internet"
     echo "    2) Cerrar el DNS y el panel a internet (cortafuegos)"
     echo "    3) Quitar el cortafuegos"
+    echo "    4) Auditoría de seguridad (solo lectura)"
     echo "    0) Volver"
     echo
     local o; o=$(ask "Opción:")
@@ -2752,6 +2974,7 @@ security_menu() {
       1) show_exposure ;;
       2) install_firewall ;;
       3) remove_firewall ;;
+      4) security_audit; pause ;;
       0|"") return ;;
     esac
   done
@@ -2795,9 +3018,9 @@ panel() {
     brow "${MUT}HOST${NC}  ${TXT}$(hostname)${NC} ${LIN}${BULLET}${NC} ${VAL}$LISTEN_IP${NC} ${LIN}${BULLET}${NC} ${MUT}$PLATFORM${NC}"
     if (( IS_VPS )); then
       if fw_active; then
-        brow "${MUT}SEGURIDAD${NC}  ${GRN}${DOT} PROTEGIDO${NC} ${LIN}${BULLET}${NC} ${MUT}DNS cerrado a internet${NC}"
+        brow "${MUT}SEGURIDAD${NC}  ${GRN}${DOT} FIREWALL${NC} ${LIN}${BULLET}${NC} ${MUT}Verificar con auditoría${NC}"
       else
-        brow "${MUT}SEGURIDAD${NC}  ${YEL}${I_SEC} ATENCIÓN${NC} ${LIN}${BULLET}${NC} ${YEL}DNS abierto a internet${NC}"
+        brow "${MUT}SEGURIDAD${NC}  ${YEL}${I_SEC} ATENCIÓN${NC} ${LIN}${BULLET}${NC} ${YEL}Sin firewall propio${NC}"
       fi
     fi
     bsep
@@ -2869,7 +3092,7 @@ case "$COMMAND" in
   -v|--version) echo "nexo-dns $NEXO_VERSION"; exit 0 ;;
   -h|--help)    sed -n '2,28p' "$0"; exit 0 ;;
   banner)       load_banner_engine || exit 1; splash; exit 0 ;;
-  install|status|health|optimize|security|firewall|engine|panel) ;;
+  install|status|health|audit|optimize|security|firewall|engine|panel) ;;
   *) err "Orden desconocida: $COMMAND"; sed -n '2,28p' "$0"; exit 1 ;;
 esac
 
@@ -2887,6 +3110,7 @@ case "$COMMAND" in
   install)  do_install ;;
   status)   show_status ;;
   health)   health_check ;;
+  audit)    security_audit ;;
   optimize) do_optimize ;;
   security) show_exposure ;;
   firewall) install_firewall ;;
