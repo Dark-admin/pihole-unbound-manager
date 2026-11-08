@@ -19,7 +19,7 @@ class FirewallTests(unittest.TestCase):
     def test_pihole_all_civetweb_ports_and_deduplication(self):
         result = self.shell('''
 ENGINE=pihole
-ph_get() { echo '"80o,443os,[::]:80o,[::]:443os,192.168.1.10:8443s"'; }
+ph_get() { echo '"+80o,443os,[::]:80o,[::]:443os,192.168.1.10:8443s"'; }
 engine_fw_ports || exit 1
 echo "$FW_TCP|$FW_UDP"
 ''')
@@ -85,6 +85,68 @@ echo "$FW_TCP|$FW_UDP"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "53,80,443,853,5335,5443,8080|53,784,5335,5443")
 
+    def test_adguard_http3_adds_the_configured_https_port_to_udp(self):
+        result = self.shell('''
+ENGINE=adguard; AGH_READY=1
+AGH_YAML=$(mktemp)
+trap 'rm -f -- "$AGH_YAML"' EXIT
+printf 'dns:\\n  serve_http3: true # DoH3\\ntls:\\n  enabled: true # TLS\\n  port_https: 8443 # custom\\n' > "$AGH_YAML"
+engine_fw_ports || exit 1
+echo "$FW_TCP|$FW_UDP"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "53,80,5335,8080,8443|53,5335,8443")
+
+    def test_adguard_rejects_an_out_of_range_encrypted_port(self):
+        result = self.shell('''
+ENGINE=adguard; AGH_YAML=README.md; AGH_READY=1
+agh_get() {
+  case "$2" in enabled) echo true ;; port_dns_over_quic) echo 65536 ;; esac
+}
+engine_fw_ports
+''')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_firewall_command_reports_failed_application(self):
+        result = self.shell('''
+need() { return 0; }
+clear_screen() { :; }
+yes_no() { return 0; }
+pause() { return 0; }
+engine_fw_ports() { :; }
+fw_trusted_networks() { FW_V4=""; FW_V6=""; }
+install_firewall_quiet() { return 1; }
+install_firewall
+''')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_failed_firewall_backup_aborts_before_applying_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.shell('''
+TEST_DIR="{}"
+FW_NFT="$TEST_DIR/firewall.nft"
+FW_UNIT="$TEST_DIR/firewall.service"
+FW_TRUST_CONF="$TEST_DIR/trusted"
+FW_NFTABLES_CONF="$TEST_DIR/nftables.conf"
+FW_NFTABLES_LOAD="$TEST_DIR/nftables-nexo.conf"
+FW_NFTABLES_DROPIN="$TEST_DIR/90-nexo-dns.conf"
+BACKUP_ROOT="$TEST_DIR/backups"
+printf 'existing rules\n' > "$FW_NFT"
+ENGINE=pihole
+ph_get() {{ echo 80; }}
+nft() {{
+  if [[ "$1" == -f ]]; then touch "$TEST_DIR/applied"; fi
+}}
+systemctl() {{ return 0; }}
+dns_healthy() {{ return 0; }}
+cp() {{ return 1; }}
+install_firewall_quiet
+'''.format(root))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((root / "firewall.nft").read_text(), "existing rules\n")
+            self.assertFalse((root / "applied").exists())
+
     def test_leading_zero_port_is_decimal(self):
         result = self.shell('fw_port_list 08')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -95,7 +157,13 @@ echo "$FW_TCP|$FW_UDP"
 ENGINE=pihole
 systemctl() { echo "$*" >&2; return 0; }
 dns_healthy() { return 0; }
-unbound-checkconf() { echo 127.0.0.1; }
+unbound-checkconf() {
+  case "$2" in interface) echo 127.0.0.1 ;; interface-automatic) echo no ;; esac
+}
+ss() {
+  printf 'udp UNCONN 0 0 127.0.0.1:5335 0.0.0.0:* users:(("unbound",pid=40,fd=5))\n'
+  printf 'tcp LISTEN 0 0 [::1]:5335 [::]:* users:(("unbound",pid=40,fd=6))\n'
+}
 fw_active() { return 0; }
 sshd() { printf 'passwordauthentication no\\npermitrootlogin no\\n'; }
 apt() { echo Listing; }
@@ -104,6 +172,45 @@ security_audit
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("is-active --quiet pihole-FTL", result.stderr)
         self.assertIn("0 fallo(s)", result.stdout)
+
+    def test_audit_rejects_unbound_automatic_interfaces(self):
+        result = self.shell('''
+ENGINE=pihole
+systemctl() { return 0; }
+dns_healthy() { return 0; }
+unbound-checkconf() {
+  case "$2" in interface) echo 127.0.0.1 ;; interface-automatic) echo yes ;; esac
+}
+fw_active() { return 0; }
+ss() {
+  printf 'udp UNCONN 0 0 127.0.0.1:5335 0.0.0.0:* users:(("unbound",pid=40,fd=5))\n'
+}
+sshd() { printf 'passwordauthentication no\npermitrootlogin no\n'; }
+apt() { echo Listing; }
+security_audit
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("interface-automatic", result.stdout)
+
+    def test_audit_rejects_unbound_wildcard_socket_on_another_port(self):
+        result = self.shell('''
+ENGINE=pihole
+systemctl() { return 0; }
+dns_healthy() { return 0; }
+unbound-checkconf() {
+  case "$2" in interface) echo 127.0.0.1 ;; interface-automatic) echo no ;; esac
+}
+fw_active() { return 0; }
+ss() {
+  printf 'udp UNCONN 0 0 127.0.0.1:5335 0.0.0.0:* users:(("unbound",pid=40,fd=5))\n'
+  printf 'tcp LISTEN 0 0 [::]:5533 [::]:* users:(("unbound",pid=40,fd=6))\n'
+}
+sshd() { printf 'passwordauthentication no\npermitrootlogin no\n'; }
+apt() { echo Listing; }
+security_audit
+''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("[::]:5533", result.stdout)
 
 
 if __name__ == "__main__":

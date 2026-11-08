@@ -20,7 +20,8 @@ def serve():
     # El UDP responde desde la misma IP consultada, incluso al probar otras subredes.
     for family, address in ((socket.AF_INET, "192.168.1.10"), (socket.AF_INET6, "fd42::10")):
         for kind, port, handler in ((socket.SOCK_STREAM, 443, tcp_loop),
-                                    (socket.SOCK_DGRAM, 53, udp_loop)):
+                                    (socket.SOCK_DGRAM, 53, udp_loop),
+                                    (socket.SOCK_DGRAM, 443, udp_loop)):
             listener = socket.socket(family, kind)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             if family == socket.AF_INET6:
@@ -32,10 +33,13 @@ def serve():
     threading.Event().wait()
 
 
-def client(address, expected):
+def client(address, expected, http3=False):
     family = socket.AF_INET6 if ":" in address else socket.AF_INET
     server = "fd42::10" if family == socket.AF_INET6 else "192.168.1.10"
-    for kind, port in ((socket.SOCK_STREAM, 443), (socket.SOCK_DGRAM, 53)):
+    probes = [(socket.SOCK_STREAM, 443), (socket.SOCK_DGRAM, 53)]
+    if http3:
+        probes.append((socket.SOCK_DGRAM, 443))
+    for kind, port in probes:
         with socket.socket(family, kind) as connection:
             connection.settimeout(1)
             connection.bind((address, 0))
@@ -46,12 +50,13 @@ def client(address, expected):
             except (TimeoutError, OSError):
                 opened = False
             if opened != (expected == "open"):
-                raise SystemExit("Resultado inesperado: {} puerto {}".format(address, port))
-    print("PASS: {} TCP/443 y UDP/53 {}".format(address, expected))
+                protocol = "TCP" if kind == socket.SOCK_STREAM else "UDP"
+                raise SystemExit("Resultado inesperado: {} {}/{}".format(address, protocol, port))
+    print("PASS: {} TCP/443, UDP/53{} {}".format(address, ", UDP/443" if http3 else "", expected))
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "serve":
         serve()
     else:
-        client(sys.argv[2], sys.argv[3])
+        client(sys.argv[2], sys.argv[3], "http3" in sys.argv[4:])

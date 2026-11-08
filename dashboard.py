@@ -2,6 +2,7 @@
 """
 dashboard.py - Panel web para Pi-hole o AdGuard Home + Unbound
 Autor: nexo (Dark)
+v4.5 - Verificaciones efectivas, instantáneas y plazo total de lectura HTTP.
 v4.4 - Solo lectura por defecto, autenticación privada y conexiones limitadas.
 v4.3 - Identidad visual compartida con el TUI y acento según el motor activo.
 v4.2 - Sigue al motor activo: lee ENGINE de /etc/nexo-dns.conf y saca los
@@ -20,14 +21,16 @@ import argparse
 import base64
 import hmac
 import html as html_lib
+import io
 import ipaddress
+import json
 import secrets
 import urllib.parse
 import socket
 import threading
 import stat
-from collections import deque
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 
 # --- Utilidades de sistema ---
 SUDO = [] if getattr(os, "geteuid", lambda: 1)() == 0 else ["sudo", "-n"]
@@ -37,6 +40,7 @@ UNBOUND_CONF = "/etc/unbound/unbound.conf.d/pi-hole.conf"
 AGH_DIR = "/opt/AdGuardHome"
 AGH_YAML = AGH_DIR + "/AdGuardHome.yaml"
 AGH_LOG = AGH_DIR + "/data/querylog.json"
+AGH_TAIL_BYTES = 4 * 1024 * 1024
 
 
 def conf_value(key):
@@ -69,33 +73,109 @@ def engine_svc():
     return "AdGuardHome" if engine() == "adguard" else "pihole-FTL"
 
 
-def agh_block_values(block, key):
-    """Valores de una clave-lista dentro de un bloque del YAML de AdGuard.
-    Sin PyYAML a proposito: no viene instalado de serie y el panel tiene que
-    arrancar en una Raspberry recien hecha."""
-    out, inblk, inkey = [], False, False
+def agh_dns_options():
+    """Lee el bloque dns que escribe AdGuard. Otra sintaxis queda sin verificar."""
+    options = {}
+    in_dns, in_clients, seen_dns = False, False, False
+    indent, key = None, None
     try:
         with open(AGH_YAML, encoding="utf-8") as f:
             for line in f:
-                s = line.rstrip("\n")
-                if re.match(r'^[A-Za-z_][A-Za-z0-9_]*:', s):
-                    inblk = s.startswith(block + ":")
-                    inkey = False
+                line = re.split(r"(^|\s+)#", line, maxsplit=1)[0].rstrip()
+                if not line or line in ("---", "..."):
                     continue
-                if not inblk:
+                if not line[0].isspace():
+                    section = re.fullmatch(r"([A-Za-z_]\w*):(?:\s+(.*))?", line)
+                    if section is None:
+                        if line.startswith("- ") and not in_dns:
+                            continue
+                        return None
+                    in_dns = section[1] == "dns"
+                    in_clients = section[1] == "clients"
+                    if in_clients and section[2] not in (None, "{}", "null", "~"):
+                        return None
+                    if in_dns:
+                        if seen_dns or section[2]:
+                            return None
+                        seen_dns = True
                     continue
-                if re.match(r'^  {}:'.format(re.escape(key)), s):
-                    inkey = True
+                if in_clients:
+                    upstream = re.fullmatch(r'''\s+(?:-\s+)?["']?upstreams["']?\s*:\s*(.*)''', line)
+                    if upstream and not re.fullmatch(r"\[\s*\]|null|~", upstream[1]):
+                        return None
+                if not in_dns:
                     continue
-                if inkey:
-                    m = re.match(r'^    - (.+)$', s)
-                    if m:
-                        out.append(m.group(1).strip())
-                    elif s.startswith("  "):
-                        inkey = False
-    except OSError:
-        pass
-    return out
+                value = line.lstrip(" ")
+                depth = len(line) - len(value)
+                if indent is None:
+                    indent = depth
+                if not depth or depth < indent or value.startswith("\t"):
+                    return None
+                if depth == indent and not value.startswith("- "):
+                    entry = re.fullmatch(r"([A-Za-z_]\w*):(?:\s+(.*))?", value)
+                    if entry is None or entry[1] in options:
+                        return None
+                    key = entry[1]
+                    options[key] = [entry[2] or ""]
+                elif key is not None:
+                    options[key].append(value)
+                else:
+                    return None
+    except (OSError, UnicodeError):
+        return None
+    return options if seen_dns else None
+
+
+def verify_upstream(uport):
+    if engine() != "adguard":
+        # El entorno del daemon puede prevalecer sobre el TOML y la CLI local.
+        pid = run(SUDO + ["systemctl", "show", "-p", "MainPID", "--value", "pihole-FTL"])
+        if pid.isascii() and pid.isdigit() and int(pid) > 0:
+            try:
+                with open("/proc/{}/environ".format(pid), "rb") as source:
+                    if any(entry.startswith(b"FTLCONF_dns_upstreams=") for entry in source.read().split(b"\0")):
+                        return None
+            except OSError:
+                return None
+        raw = run(SUDO + ["pihole-FTL", "--config", "dns.upstreams"])
+        target = "127.0.0.1#{}".format(uport)
+        try:
+            values = json.loads(raw)
+        except ValueError:
+            # Algunas versiones imprimen el array sin comillas. Solo se usa
+            # la salida completa de la CLI, nunca una búsqueda en el TOML.
+            item = r"[A-Za-z0-9._:#%/+-]+"
+            plain = re.fullmatch(r"\[\s*(" + item + r"(?:\s*,\s*" + item + r")*)\s*\]", raw)
+            if plain is None:
+                return None
+            values = [value.strip() for value in plain[1].split(",")]
+        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+            return None
+        return values == [target]
+
+    options = agh_dns_options()
+    if options is None or "upstream_dns" not in options:
+        return None
+    file_setting = options.get("upstream_dns_file", [""])
+    if file_setting not in ([""], ['""'], ["''"], ["null"], ["~"]):
+        # AdGuard da prioridad al archivo. Su contenido puede cambiar por separado.
+        return None
+    fallback = options.get("fallback_dns", [""])
+    if len(fallback) > 1:
+        return False
+    if fallback[0] not in ("", "null", "~"):
+        inline_list = re.fullmatch(r"\[(.*)\]", fallback[0])
+        if inline_list is None:
+            return None
+        if inline_list[1].strip():
+            return False
+    values = options["upstream_dns"]
+    target = "127.0.0.1:{}".format(uport)
+    if not values[0] and all(value.startswith("- ") for value in values[1:]):
+        return values[1:] in (["- " + target], ['- "{}"'.format(target)], ["- '{}'".format(target)])
+    if re.fullmatch(r"\[\s*\]", values[0]):
+        return False
+    return None
 
 def run(cmd):
     """Ejecuta una orden sin pasarla por un intérprete de shell."""
@@ -104,8 +184,8 @@ def run(cmd):
             cmd, shell=False, capture_output=True, text=True, timeout=10,
             check=False,
         )
-        return out.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return ""
 
 def service_active(name):
@@ -143,16 +223,48 @@ def pihole_port():
         pass
     return "53"
 
-def dig_test(server, port=""):
-    cmd = ["dig", "+short", "+time=2", "google.com", "@{}".format(server)]
+def dns_reply(name, server, port, *flags):
+    cmd = ["dig", "-r", "+noall", "+comments", "+answer", "+time=2",
+           "+tries=1", "-q", name, "-t", "A", "@{}".format(server), *flags]
     if port:
         cmd.extend(["-p", str(port)])
-    out = run(cmd).splitlines()
-    out = out[0] if out else ""
-    # dig +short escribe ";; communications error" por stdout, no por stderr
-    if out and not out.startswith(";;") and "." in out:
-        return out
-    return ""
+    output = run(cmd)
+    status = re.search(r"^;; ->>HEADER<<- opcode: QUERY, status: ([A-Z]+),", output, re.M)
+    flags_line = re.search(r"^;; flags: ([^;]+);", output, re.M)
+    address = ""
+    if status and status[1] == "NOERROR":
+        for answer in re.finditer(r"^\S+\s+\d+\s+IN\s+A\s+([\d.]+)\s*$", output, re.M):
+            try:
+                ip = ipaddress.IPv4Address(answer[1])
+                if ip.is_global and not ip.is_multicast:
+                    address = answer[1]
+                    break
+            except ValueError:
+                pass
+    return status[1] if status else None, flags_line[1].split() if flags_line else [], address
+
+
+def dig_test(server, port=""):
+    return dns_reply("google.com", server, port)[2]
+
+
+def verify_dnssec(uport):
+    status, flags, address = dns_reply("cloudflare.com", "127.0.0.1", uport,
+                                       "+dnssec", "+adflag", "+nocdflag")
+    if status is None:
+        return None
+    if status != "NOERROR" or "ad" not in flags or not address:
+        return False
+    status, _, _ = dns_reply("dnssec-failed.org", "127.0.0.1", uport,
+                             "+dnssec", "+nocdflag")
+    if status is None:
+        return None
+    if status != "SERVFAIL":
+        return False
+    # Sin validación el nombre debe resolver, o SERVFAIL podría ser un fallo de red.
+    _, _, unchecked = dns_reply("dnssec-failed.org", "127.0.0.1", uport,
+                                "+dnssec", "+cdflag")
+    return True if unchecked else None
 
 def count_gravity():
     """Dominios bloqueados. Pi-hole los tiene en gravity; AdGuard hay que
@@ -209,31 +321,91 @@ def list_adlists():
     except Exception:
         return []
 
-def port_open(port):
-    """Verifica si un puerto esta escuchando."""
-    try:
-        output = run(SUDO + ["ss", "-tlnp"])
-        return re.search(r':{}\s'.format(re.escape(str(port))), output) is not None
-    except Exception:
+def listening_sockets():
+    output = run(SUDO + ["ss", "-H", "-lntup"])
+    sockets = []
+    for line in output.splitlines():
+        fields = line.split(None, 6)
+        if len(fields) >= 6 and fields[0] in ("tcp", "udp"):
+            host, _, port = fields[4].rpartition(":")
+            process = fields[6] if len(fields) == 7 else ""
+            sockets.append((fields[0], host.strip("[]").split("%", 1)[0], port, process))
+    return sockets
+
+
+def verify_unbound_listening(uport, sockets):
+    # checkconf también carga los includes. ss contrasta lo que realmente abrió el proceso.
+    interfaces = run(SUDO + ["unbound-checkconf", "-o", "interface"]).split()
+    automatic = run(SUDO + ["unbound-checkconf", "-o", "interface-automatic"])
+    if automatic == "yes" or any(
+            not is_loopback_host(interface.split("@", 1)[0]) for interface in interfaces):
         return False
+    protocols = set()
+    unidentified = False
+    for protocol, host, port, process in sockets:
+        if re.search(r'\("unbound",pid=\d+,', process):
+            if not is_loopback_host(host):
+                return False
+            if port == uport:
+                protocols.add(protocol)
+        elif port == uport and not process:
+            unidentified = True
+    if automatic == "no" and protocols == {"tcp", "udp"} and not unidentified:
+        return True
+    return None
+
+
+def agh_client_count():
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=1)
+    ips = set()
+    found, incomplete = False, False
+    for path in (AGH_LOG, AGH_LOG + ".1"):
+        try:
+            with open(path, "rb") as source:
+                end = source.seek(0, os.SEEK_END)
+                offset = max(0, end - AGH_TAIL_BYTES)
+                source.seek(max(0, offset - 1))
+                tail = source.read(end - offset + bool(offset))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "?"
+        found = True
+        if offset:
+            # Descarta solo la primera línea si quedó cortada por el seek.
+            _, _, tail = tail.partition(b"\n")
+        covers_cutoff = False
+        for line in tail.splitlines():
+            try:
+                item = json.loads(line)
+                stamp = item["T"]
+                if not isinstance(stamp, str):
+                    continue
+                # AdGuard escribe RFC 3339 con hasta 9 decimales. Python 3.8
+                # requiere una fracción de 3 o 6 dígitos y no reconoce Z.
+                stamp = re.sub(r"\.(\d+)", lambda m: "." + m[1].ljust(6, "0")[:6], stamp)
+                when = datetime.fromisoformat(stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp)
+                if when.tzinfo is None:
+                    continue
+                if when < cutoff:
+                    covers_cutoff = True
+                elif when <= now:
+                    ip = item["IP"]
+                    if isinstance(ip, str):
+                        ips.add(ipaddress.ip_address(ip))
+            except (KeyError, TypeError, ValueError, RecursionError):
+                continue
+        incomplete |= bool(offset) and not covers_cutoff
+    if not found:
+        return "?"
+    return "{}{}".format(len(ips), "+" if incomplete else "")
 
 def clients_24h():
     """Cuantos clientes usan de verdad este DNS. Si son muy pocos, casi seguro
     el router sigue repartiendo su propio DNS y esto esta de adorno."""
     if engine() == "adguard":
-        # AdGuard no usa SQLite: el registro es JSON, una linea por consulta.
-        # Se mira solo la cola; recorrerlo entero en una Pi 3 se nota.
-        try:
-            with open(AGH_LOG, encoding="utf-8", errors="replace") as f:
-                lines = deque(f, maxlen=20000)
-        except OSError:
-            return "?"
-        ips = set()
-        for line in lines:
-            m = re.search(r'"IP":"([^"]+)"', line)
-            if m:
-                ips.add(m.group(1))
-        return str(len(ips))
+        return agh_client_count()
     sql = ("SELECT COUNT(DISTINCT client) FROM query_storage "
            "WHERE timestamp > strftime('%s','now','-1 day');")
     n = run(SUDO + [
@@ -251,46 +423,15 @@ def verify():
                   "/var/lib/unbound/root.hints",
                   "/etc/unbound/root.hints")
     )
-    # Prueba real de DNSSEC: una firma rota TIENE que ser rechazada
-    servfail = "SERVFAIL" in run([
-        "dig", "dnssec-failed.org", "@127.0.0.1", "-p", str(uport), "+time=3",
-    ])
-    # Unbound debe escuchar solo en localhost, no ser un recursivo abierto
-    # checkconf también carga los includes; leer un solo fichero podría omitir
-    # una segunda interfaz pública definida en otro fragmento de configuración.
-    interfaces = run(SUDO + ["unbound-checkconf", "-o", "interface"]).split()
-    localhost_only = bool(interfaces) and all(
-        value.split("@", 1)[0] in ("127.0.0.1", "::1") for value in interfaces)
-
-    # En pihole.toml v6 el valor va en la linea SIGUIENTE a "upstreams = [",
-    # asi que un grep simple nunca lo encuentra. Se usa la API de Pi-hole, y
-    # solo se cae al fichero (con -A3) si no hay CLI v6.
-    # Cada motor apunta a Unbound con su propia sintaxis: Pi-hole usa
-    # 127.0.0.1#5335 y AdGuard 127.0.0.1:5335.
-    if engine() == "adguard":
-        upstream_ok = agh_block_values("dns", "upstream_dns") == [
-            "127.0.0.1:{}".format(uport)]
-    else:
-        upstream_raw = run(SUDO + ["pihole-FTL", "--config", "dns.upstreams"])
-        if not upstream_raw:
-            try:
-                with open("/etc/pihole/pihole.toml", encoding="utf-8") as f:
-                    config = f.read()
-                    dns_section = re.search(r"(?ms)^\[dns\]\s*\n(.*?)(?=^\[|\Z)", config)
-                    upstream_match = re.search(r"(?s)\bupstreams\s*=\s*\[(.*?)\]", dns_section[1]) if dns_section else None
-                    upstream_raw = upstream_match[1] if upstream_match else ""
-            except OSError:
-                upstream_raw = ""
-        upstream_ok = re.findall(r'"([^"\n]+)"', upstream_raw) == [
-            "127.0.0.1#{}".format(uport)]
-
+    sockets = listening_sockets()
+    listening_ports = {port for protocol, _, port, _ in sockets if protocol == "tcp"}
     filtro = "AdGuard" if engine() == "adguard" else "Pi-hole"
     return {
-        "Puerto {} ({})".format(pport, filtro): port_open(pport),
-        "Puerto {} (Unbound)".format(uport): port_open(uport),
-        "Unbound solo en localhost": localhost_only,
-        "Upstream = Unbound": upstream_ok,
-        "DNSSEC rechaza firmas rotas": servfail,
+        "Puerto {} ({})".format(pport, filtro): pport in listening_ports,
+        "Puerto {} (Unbound)".format(uport): uport in listening_ports,
+        "Unbound solo en localhost": verify_unbound_listening(uport, sockets),
+        "Upstream = Unbound": verify_upstream(uport),
+        "DNSSEC rechaza firmas rotas": verify_dnssec(uport),
         "Root hints": hints_ok,
     }
 
@@ -359,12 +500,13 @@ section h2{font-size:1.1rem;margin-bottom:1rem;color:var(--cyan)}
 footer{text-align:center;color:var(--muted);font-size:.8rem;margin-top:2rem}
 """
 
-def render_html(data):
+def render_html(data, age=0):
     pihole_dot = "ok" if data["pihole"] else "bad"
     unbound_dot = "ok" if data["unbound"] else "bad"
     checks = "".join(
-        '<div class="check"><span>{}</span><span class="dot {}"></span></div>'.format(
-            html_lib.escape(str(k)), "ok" if v else "bad")
+        '<div class="check"><span>{}</span><span><span class="dot {}"></span>{}</span></div>'.format(
+            html_lib.escape(str(k)), "warn" if v is None else "ok" if v else "bad",
+            "Sin verificar" if v is None else "Correcto" if v else "Error")
         for k, v in data["verify"].items()
     )
     lists = "".join(
@@ -380,7 +522,7 @@ def render_html(data):
         few = int(data["clients"]) <= 2
     except (ValueError, TypeError):
         few = False
-    clients_dot = "warn" if few else "ok"
+    clients_dot = "warn" if few or not str(data["clients"]).isdigit() else "ok"
     hint = ('<div class="hint">Muy pocos clientes para una red domestica. '
             'Revisa el DHCP de tu router: debe repartir la IP de esta maquina '
             'como UNICO servidor DNS. Un secundario publico salta el filtrado.</div>') if few else ""
@@ -399,7 +541,7 @@ def render_html(data):
         '  <img src="/logo.svg" alt="nexo-dns logo">'
         '  <div class="tag">DNS privado, filtrado y recursivo</div>'
         '</div>'
-        '<header><h1>nexo-dns</h1><span class="badge">Actualizado: {}</span></header>'
+        '<header><h1>nexo-dns</h1><span class="badge">Instantánea: {} · hace {} s</span></header>'
         '<div class="grid">'
         '  <div class="card"><div class="label">{}</div><div class="value"><span class="dot {}"></span>{}</div></div>'
         '  <div class="card"><div class="label">Unbound</div><div class="value"><span class="dot {}"></span>{}</div></div>'
@@ -417,7 +559,7 @@ def render_html(data):
         '<footer>nexo-dns by nexo (Dark)</footer>'
         '</div></body></html>'
     ).format(
-        CSS, engine_key, html_lib.escape(str(data["timestamp"])),
+        CSS, engine_key, html_lib.escape(str(data["timestamp"])), age,
         html_lib.escape(str(data.get("engine_label", "Pi-hole FTL"))),
         pihole_dot, pihole_status,
         unbound_dot, unbound_status,
@@ -492,14 +634,54 @@ def is_loopback_host(host):
     except ValueError:
         return False
 
+
+def parse_host_authority(value):
+    if not re.fullmatch(r"(?:[A-Za-z0-9_.-]+|\[[A-Za-z0-9:.%_-]+\])(?::[0-9]+)?", value):
+        return None
+    try:
+        authority = urllib.parse.urlsplit("//" + value)
+        if authority.hostname and authority.port != 0:
+            return authority.hostname.lower(), authority.port
+    except ValueError:
+        pass
+    return None
+
+
 # --- Servidor HTTP ---
+class DeadlineReader(io.RawIOBase):
+    """Aplica el mismo plazo a cada lectura del socket, incluso dentro del búfer."""
+
+    def __init__(self, connection, timeout):
+        super().__init__()
+        self.connection = connection
+        self.deadline = time.monotonic() + timeout
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("Plazo de lectura agotado")
+        previous = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(remaining)
+            return self.connection.recv_into(buffer)
+        finally:
+            self.connection.settimeout(previous)
+
+
 class BoundedHTTPServer(http.server.ThreadingHTTPServer):
     """Panel privado: acota conexiones y tiempo de lectura; no servidor público."""
     daemon_threads = True
     request_queue_size = 16
+    read_timeout = 5
+    snapshot_ttl = 10
 
     def __init__(self, address, handler, max_connections=16):
         self.slots = threading.BoundedSemaphore(max_connections)
+        self._snapshot_lock = threading.Lock()
+        self._snapshot = None
         self.allowed_hosts = {address[0].lower()}
         if is_loopback_host(address[0]):
             self.allowed_hosts.update({"localhost", "127.0.0.1", "::1"})
@@ -509,8 +691,22 @@ class BoundedHTTPServer(http.server.ThreadingHTTPServer):
 
     def get_request(self):
         connection, address = super().get_request()
-        connection.settimeout(5)
+        connection.settimeout(self.read_timeout)
         return connection, address
+
+    def get_snapshot(self):
+        with self._snapshot_lock:
+            now = time.monotonic()
+            if self._snapshot is None or now - self._snapshot[1] >= self.snapshot_ttl:
+                data = collect()
+                self._snapshot = now, time.monotonic(), data
+            started, _, data = self._snapshot
+            return data, int(time.monotonic() - started)
+
+    def restart_services(self):
+        with self._snapshot_lock:
+            self._snapshot = None
+            return restart()
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
@@ -552,16 +748,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "nexo-dns"
     sys_version = ""
 
+    def setup(self):
+        super().setup()
+        self.rfile.close()
+        self.rfile = io.BufferedReader(DeadlineReader(self.connection, self.server.read_timeout))
+
     def trusted_host(self):
         # Evita DNS rebinding: Origin no basta si el Host también es del atacante.
-        try:
-            authority = urllib.parse.urlsplit("//" + self.headers.get("Host", ""))
-            return (not authority.username and not authority.password
-                    and not authority.path and not authority.query and not authority.fragment
-                    and authority.hostname in self.server.allowed_hosts
-                    and authority.port in (None, self.server.server_port))
-        except ValueError:
+        values = self.headers.get_all("Host", [])
+        if len(values) != 1:
             return False
+        authority = parse_host_authority(values[0])
+        if authority is None:
+            return False
+        host, port = authority
+        return (port in (None, self.server.server_port) and host in self.server.allowed_hosts
+                or port is not None and values[0].lower() in self.server.allowed_hosts)
+
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", (
@@ -575,7 +778,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _deny(self):
         self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="nexo-dns"')
+        self.send_header("WWW-Authenticate", 'Basic realm="nexo-dns", charset="UTF-8"')
         self.end_headers()
 
     def do_GET(self):
@@ -608,8 +811,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path != "/":
             self.send_error(404)
             return
-        data = collect()
-        html = render_html(data)
+        data, age = self.server.get_snapshot()
+        html = render_html(data, age)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -626,25 +829,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not ALLOW_RESTART:
                 self.send_error(403, "Panel de solo lectura")
                 return
-            if self.headers.get("Transfer-Encoding"):
+            lengths = self.headers.get_all("Content-Length", [])
+            if "Transfer-Encoding" in self.headers or len(lengths) != 1:
                 self.send_error(400, "Solicitud no valida")
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
+                length = int(lengths[0])
             except ValueError:
                 length = 0
             if length <= 0 or length > 4096:
                 self.send_error(400, "Solicitud no valida")
                 return
+            if not same_origin(self.headers):
+                self.send_error(403, "Solicitud rechazada")
+                return
+            raw_body = self.rfile.read(length)
+            if len(raw_body) != length:
+                self.send_error(400, "Solicitud no valida")
+                return
             try:
-                body = self.rfile.read(length).decode("utf-8", errors="strict")
+                body = raw_body.decode("utf-8")
             except UnicodeDecodeError:
                 self.send_error(400, "Solicitud no valida")
                 return
-            if not same_origin(self.headers) or not csrf_valid(body):
+            if not csrf_valid(body):
                 self.send_error(403, "Solicitud rechazada")
                 return
-            if not restart():
+            if not self.server.restart_services():
                 self.send_error(503, "No se pudo reiniciar; revisa los servicios desde el TUI")
                 return
             self.send_response(302)
@@ -663,7 +874,8 @@ def main():
     ap.add_argument("--port", type=int, default=8080, help="Puerto (default: 8080)")
     ap.add_argument("--auth", help="Autenticacion basica: usuario:password")
     ap.add_argument("--auth-file", help="Archivo privado (600) con usuario:contraseña")
-    ap.add_argument("--allowed-host", action="append", default=[], help="Nombre DNS o IP autorizado en Host; repetible")
+    ap.add_argument("--allowed-host", action="append", default=[],
+                    help="Nombre DNS o IP autorizado en Host, con puerto opcional; repetible")
     ap.add_argument("--allow-restart", action="store_true", help="Habilita reinicios (por defecto: solo lectura)")
     ap.add_argument(
         "--allow-unauthenticated", action="store_true",
@@ -677,6 +889,18 @@ def main():
         ap.error("Puerto fuera de rango")
     if args.host in ("0.0.0.0", "::") and not args.allowed_host:
         ap.error("Una escucha global exige --allowed-host con la IP o nombre usado para acceder")
+    allowed_hosts = set()
+    for value in args.allowed_host:
+        authority = parse_host_authority(value)
+        if authority:
+            host, port = authority
+            allowed_hosts.add(host if port is None else value.lower())
+        else:
+            try:
+                ipaddress.IPv6Address(value)
+            except ValueError:
+                ap.error("--allowed-host requiere un nombre DNS o IP; usa [IPv6]:puerto si añades puerto")
+            allowed_hosts.add(value.lower())
     if args.auth and args.auth_file:
         ap.error("Usa --auth o --auth-file, no ambos")
     if args.auth_file:
@@ -702,7 +926,7 @@ def main():
         print("AVISO: Basic Auth no cifra el trafico. Usa Tailscale o un proxy HTTPS.")
 
     with BoundedHTTPServer((args.host, args.port), Handler) as httpd:
-        httpd.allowed_hosts.update(value.lower() for value in args.allowed_host)
+        httpd.allowed_hosts.update(allowed_hosts)
         print("Dashboard en http://{}:{}".format(args.host, args.port))
         if args.host == "0.0.0.0":
             print("  Accede desde: http://<IP-del-servidor>:{}".format(args.port))

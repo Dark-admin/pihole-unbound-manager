@@ -50,8 +50,11 @@ Los dos pueden estar instalados a la vez, pero **solo uno puede tener el puerto
 
 ## Instalación
 
+Descarga una versión desde [Releases](https://github.com/Dark-admin/pihole-unbound-manager/releases),
+verifica los SHA-256 del manifiesto correspondiente y ejecuta desde la carpeta
+extraída.
+
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Dark-admin/pihole-unbound-manager/main/nexo-dns.sh
 sudo bash nexo-dns.sh install
 ```
 
@@ -73,29 +76,36 @@ Después, para todo lo demás:
 sudo bash nexo-dns.sh
 ```
 
-### Actualizar desde 4.3
+### Actualizar a 4.5
 
-Descarga primero una copia nueva, comprueba su sintaxis y conserva el script
-anterior antes de reemplazarlo. Ejecutar `--version` no modifica servicios:
+Extrae `nexo-dns-4.5.zip` junto al script actual y coloca el manifiesto
+`SHA256SUMS-v4.5.txt` en la misma carpeta que el ZIP. Usa el bloque desde esa
+carpeta. Cada comprobación debe terminar bien antes de reemplazar el script.
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/Dark-admin/pihole-unbound-manager/main/nexo-dns.sh \
-  -o nexo-dns-4.4.sh
-bash -n nexo-dns-4.4.sh && bash nexo-dns-4.4.sh --version
-cp -a nexo-dns.sh "nexo-dns.sh.bak-$(date +%Y%m%d-%H%M%S)"
-cp nexo-dns-4.4.sh nexo-dns.sh
-sudo bash nexo-dns.sh audit
-sudo bash nexo-dns.sh firewall
+(
+  set -e
+  release=./nexo-dns-4.5
+  (cd "$release" && sha256sum --strict -c ../SHA256SUMS-v4.5.txt)
+  bash -n "$release/nexo-dns.sh"
+  test "$(bash "$release/nexo-dns.sh" --version)" = 'nexo-dns 4.5'
+  backup=$(mktemp ./nexo-dns.sh.bak.XXXXXX)
+  cp -p -- nexo-dns.sh "$backup"
+  swap=$(mktemp ./.nexo-dns.sh.XXXXXX)
+  trap 'rm -f -- "$swap"' EXIT
+  install -m 755 -- "$release/nexo-dns.sh" "$swap"
+  mv -fT -- "$swap" nexo-dns.sh
+)
 ```
 
-La última orden muestra los puertos y redes que se protegerán y solicita
-confirmación. Descargar el script no actualiza las reglas ya instaladas.
+Después del reemplazo, `sudo bash nexo-dns.sh audit` comprueba el estado.
+`sudo bash nexo-dns.sh firewall` muestra los puertos y redes que se protegerán
+y solicita confirmación antes de actualizar el firewall.
 Revisa las redes de confianza antes de aplicar: un cliente de otra subred
 necesita una entrada explícita en `/etc/nexo-dns-trusted.conf`. Tras aplicar,
 prueba desde un cliente permitido y uno no permitido; comprueba también la
 carga después de reiniciar. No hace falta repetir `install` para actualizar
-el panel o el firewall. Consulta [los cambios de 4.4](CHANGELOG.md).
+el panel o el firewall. Consulta [los cambios de 4.5](CHANGELOG.md).
 
 ## El panel
 
@@ -113,7 +123,7 @@ el panel o el firewall. Consulta [los cambios de 4.4](CHANGELOG.md).
   │          ********+          +%%%+            │
   │            +***+                             │
   │        Pi-hole • Unbound • Tailscale         │
-  │                nexo-dns v4.4                 │
+  │                nexo-dns v4.5                 │
   │        Privado • filtrado • recursivo        │
   ├──────────────────────────────────────────────┤
   │ ● Pi-hole :53    ● Unbound :5335             │
@@ -254,6 +264,7 @@ Sin abrir el panel, útiles para cron o scripts:
 | `sudo bash nexo-dns.sh install` | Instalación completa |
 | `sudo bash nexo-dns.sh status` | Estado de servicios, caché y recursos |
 | `sudo bash nexo-dns.sh health` | Chequeo con consultas reales |
+| `bash nexo-dns.sh bench --json` | Medición DNS por capa y fase |
 | `sudo bash nexo-dns.sh optimize` | Reaplica la optimización de Unbound |
 | `sudo bash nexo-dns.sh security` | Qué tienes expuesto a internet |
 | `sudo bash nexo-dns.sh firewall` | Cierra el DNS y el panel al exterior |
@@ -304,8 +315,8 @@ activas DNS cifrado hay un resolver esperando en **853** (DoT), **443** (DoH),
 **784** (DoQ) y **5443** (DNSCrypt). Cerrar solo el 53 dejaría el mismo servidor
 accesible por otra puerta, con el panel diciendo que está cerrado a internet.
 
-Los puertos se leen del bloque `tls:` de tu YAML, así que **solo se cierran los
-que tengas levantados de verdad**. El 3000 del asistente se cierra únicamente si
+Los puertos cifrados se leen del YAML. Si `dns.serve_http3` está activo, el
+puerto HTTPS también se protege por UDP. El 3000 del asistente se protege si
 está a medias: al terminarlo AdGuard mueve el panel al puerto elegido y el 3000
 deja de escuchar.
 
@@ -329,6 +340,12 @@ exige una respuesta DNS `NOERROR` con un registro A antes y después. Si falla,
 restaura las reglas previas. Los respaldos privados quedan en
 `/var/backups/nexo-dns/firewall.*`. Tras aplicar exige que el servicio esté activo
 y habilitado; la comprobación posterior al reinicio se hace aparte.
+
+Reaplica `sudo bash nexo-dns.sh firewall` al migrar de 4.4. Con la unidad
+estándar de `nftables`, Nexo incluye sus reglas en el mismo lote que carga
+`/etc/nftables.conf` al iniciar o recargar. Conserva ese archivo. Si la unidad
+tiene órdenes de carga personalizadas, la migración se detiene y conserva la
+configuración previa para que puedas integrarlas manualmente.
 
 > Esto es el cortafuegos del sistema. Si tu proveedor tiene además grupos de
 > seguridad (AWS, Azure, GCP), revísalos: son una segunda puerta por delante
@@ -356,21 +373,39 @@ gasta CPU), `domainNeeded` y `bogusPriv` activos, y `EDNS0ECS` desactivado.
 
 ## Precalentado de caché
 
-Un resolver recursivo paga un peaje la primera vez que ve un dominio: pregunta a
-los raíz, al TLD y al autoritativo. Son 200-500 ms. Después queda en caché y baja
-a 2-5 ms.
+La opción **9** instala un temporizador que consulta a Unbound hasta 100 pares
+de dominio y tipo del historial de tu motor activo. Empieza unos minutos
+después de arrancar y vuelve a ejecutarse cada media hora con un pequeño
+retardo aleatorio. Separa respuestas utilizables, negativas y fallidas. AdGuard
+requiere `python3` para leer el historial. Ejecuta de nuevo la opción **9** al
+actualizar un precalentador de 4.4.
 
-La opción **9** instala un temporizador que coge los dominios que *tú* más usas
-—sacados del historial de Pi-hole— y los resuelve cada 30 minutos y 3 minutos
-después de cada arranque, que es cuando la caché está vacía y más duele.
+## Medir latencia DNS
 
-Medido en una Pi 3B con esto activo:
+```bash
+bash nexo-dns.sh bench --json
+bash nexo-dns.sh bench --json --layer filter --server 192.168.1.53 --filter-port 53
+bash nexo-dns.sh bench --json --layer unbound --unbound-port 5335 --names corpus.txt --samples 3
+```
 
-| | Antes | Después |
-|---|---|---|
-| `wikipedia.org` en frío | 465 ms | 30 ms |
-| Mediana en caliente | — | 4,5 ms |
-| Cloudflare `1.1.1.1` (mediana) | 60 ms | — |
+Para medir desde otro equipo de tu LAN, sustituye la IP del ejemplo por la de
+tu filtro. El corpus admite hasta 50 pares `dominio tipo` con `A`, `AAAA`,
+`HTTPS` o `SVCB`, uno por línea. `first_pass` usa la caché existente y `repeat`
+repite el corpus. El comando informa p50, p95, p99, fallos y muestras omitidas
+por tiempo. Cada fase está acotada y deja la caché en servicio. Para medir en
+frío, usa instancias nuevas en un entorno de pruebas. Compara cada capa por
+separado para evitar que una caliente a la otra.
+
+En laboratorio, `sudo bash nexo-dns.sh optimize --referral standard` deja que
+Unbound use el comportamiento estándar de referrals, con DNSSEC activo.
+`--referral extra` recupera el endurecimiento adicional de 4.4. `--min-ttl 0`
+respeta los TTL cortos del autoritativo; `--min-ttl 120` restaura el suelo de
+4.4. Son controles para comparar perfiles, con un cambio por ensayo. Comprueba
+los errores, la frescura y p95 antes de aplicar el perfil a la red. [Manual de Unbound](https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html#unbound-conf-harden-referral-path)
+
+Si el cambio es compatible, `optimize` recarga Unbound conservando su caché.
+Cuando cambia la escucha, los tamaños de caché, los hilos o una directiva
+fuera de los perfiles comparables, reinicia y vuelve a comprobar DNSSEC.
 
 ## Sobre BBR
 
@@ -509,7 +544,7 @@ sudo nano /etc/nexo-dashboard.auth
 sudo python3 dashboard.py --port 8080 --auth-file /etc/nexo-dashboard.auth
 ```
 
-Muestra estado de servicios, dominios bloqueados y listas activas. En 4.4 es de
+Muestra estado de servicios, dominios bloqueados y listas activas. Es de
 solo lectura por defecto; `--allow-restart` habilita explícitamente el botón y
 la acción de reinicio. Por defecto escucha solo en `127.0.0.1`; una escucha en
 una IP de red **exige autenticación** (`--auth-file` o `--auth`). Si se intenta abrir fuera
@@ -519,6 +554,10 @@ Una escucha global en `0.0.0.0` o `::` exige también `--allowed-host` con cada
 nombre o IP autorizado para acceder. Una escucha en una IP concreta permite
 esa IP; puedes añadir nombres con la misma opción. Esto ayuda a evitar DNS
 rebinding y rechaza solicitudes con un Host inesperado.
+Si el proxy conserva un puerto externo distinto al del panel, autoriza la
+autoridad exacta, por ejemplo `--allowed-host panel.example:8443`. El panel
+comparte un estado reciente entre visitas para evitar repetir las mismas
+consultas a servicios, listas e historial por cada navegador.
 
 Basic Auth autentica, pero no cifra el tráfico. Para administrarlo desde fuera
 de la máquina, puedes conservar la escucha local y usar un túnel SSH:
@@ -569,7 +608,7 @@ Esto no toca Pi-hole ni Unbound, solo lo que añade este script.
 - Raspberry Pi OS, Debian 11+ o Ubuntu 20.04+
 - `systemd`, `bash`, `curl`, `dnsutils`, `iproute2`
 - Root
-- Python 3 solo para `dashboard.py`
+- Python 3.8+ para `dashboard.py` y para el precalentador con AdGuard Home
 
 ---
 

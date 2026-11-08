@@ -18,20 +18,59 @@ cleanup() {
 trap cleanup EXIT
 FW_NFT="$task_dir/firewall.nft"
 FW_UNIT="$task_dir/firewall.service"
+FW_NFTABLES_CONF="$task_dir/nftables.conf"
+FW_NFTABLES_LOAD="$task_dir/nftables-nexo.conf"
+FW_NFTABLES_DROPIN="$task_dir/nftables.service.d/90-nexo-dns.conf"
 FW_TRUST_CONF="$task_dir/trusted"
 BACKUP_ROOT="$task_dir/backups"
 printf 'IPV4=192.168.1.0/24\nIPV6=fe80::/10,fd42::/64\n' > "$FW_TRUST_CONF"
+printf 'flush ruleset\ntable inet unrelated { }\n' > "$FW_NFTABLES_CONF"
 ENGINE=pihole
 WEB_TEST='80o,443os,[::]:80o,[::]:443os'
 ph_get() { printf '%s\n' "$WEB_TEST"; }
 SYSTEMD_TEST=ok
 SERVICE_ACTIVE=no
+SERVICE_ENABLED=no
 STOP_CALLS=0
+NATIVE_TEST=ok
+STATE_TEST=ok
 systemctl() {
-  [[ "$1" != is-enabled ]] || return 1
+  if [[ "$1" == show && "${*: -1}" == nexo-dns-firewall.service ]]; then
+    [[ "$STATE_TEST" == ok ]] || return 1
+    if [[ "$SERVICE_ACTIVE" == yes ]]; then
+      printf 'ActiveState=active\n'
+    else
+      printf 'ActiveState=inactive\n'
+    fi
+    if [[ "$SERVICE_ENABLED" == yes ]]; then
+      printf 'UnitFileState=enabled\n'
+    elif [[ -f "$FW_UNIT" ]]; then
+      printf 'UnitFileState=disabled\n'
+    else
+      printf 'UnitFileState=\n'
+    fi
+    return
+  fi
+  if [[ "$1" == show && "${*: -1}" == nftables.service ]]; then
+    local nftbin config
+    nftbin=$(command -v nft)
+    config="$FW_NFTABLES_CONF"
+    [[ "$NATIVE_TEST" == ok ]] || config="$task_dir/custom.conf"
+    if [[ -f "$FW_NFTABLES_DROPIN" ]]; then
+      config="$FW_NFTABLES_LOAD"
+    else
+      printf 'ExecStop={ path=%s ; argv[]=%s flush ruleset ; ignore_errors=no ; }\n' "$nftbin" "$nftbin"
+    fi
+    printf 'ExecStart={ path=%s ; argv[]=%s -f %s ; ignore_errors=no ; }\n' "$nftbin" "$nftbin" "$config"
+    printf 'ExecReload={ path=%s ; argv[]=%s -f %s ; ignore_errors=no ; }\n' "$nftbin" "$nftbin" "$config"
+    return
+  fi
+  if [[ "$1" == is-enabled ]]; then [[ "$SERVICE_ENABLED" == yes ]]; return; fi
   if [[ "$1" == is-active ]]; then [[ "$SERVICE_ACTIVE" == yes ]]; return; fi
   if [[ "$1" == stop ]]; then STOP_CALLS=$((STOP_CALLS+1)); SERVICE_ACTIVE=no; fi
-  if [[ "$1" == enable && "$SYSTEMD_TEST" == ok ]]; then SERVICE_ACTIVE=yes; fi
+  if [[ "$1" == start ]]; then SERVICE_ACTIVE=yes; fi
+  if [[ "$1" == disable ]]; then SERVICE_ENABLED=no; fi
+  if [[ "$1" == enable && "$SYSTEMD_TEST" == ok ]]; then SERVICE_ACTIVE=yes; SERVICE_ENABLED=yes; fi
   [[ "$SYSTEMD_TEST" != fail || "$1" != enable ]]
 }
 sshd() { printf 'port 22\n'; }
@@ -42,7 +81,20 @@ dns_healthy() {
   [[ "$DNS_TEST" == ok || "$DNS_CALLS" -eq 1 ]]
 }
 nft add table inet unrelated
+NATIVE_TEST=fail
+if install_firewall_quiet; then echo 'ERROR: reemplazó un nftables.service personalizado'; exit 1; fi
+if fw_active; then echo 'ERROR: aplicó reglas con nftables.service personalizado'; exit 1; fi
+NATIVE_TEST=ok
 install_firewall_quiet
+old_saved=$(sha256sum "$FW_NFT")
+old_live=$(nft -s list table inet nexo_dns)
+WEB_TEST='9443s'
+STATE_TEST=fail
+if install_firewall_quiet; then echo 'ERROR: aceptó respaldo sin estado de servicio'; exit 1; fi
+STATE_TEST=ok
+WEB_TEST='80o,443os,[::]:80o,[::]:443os'
+[[ $(sha256sum "$FW_NFT") == "$old_saved" ]]
+[[ $(nft -s list table inet nexo_dns) == "$old_live" ]]
 systemd-analyze verify "$FW_UNIT"
 nft list table inet nexo_dns | grep -q '443'
 nft list table inet nexo_dns | grep -q 'tailscale0'
@@ -81,6 +133,33 @@ nsenter -t "$client_pid" -n python3 tests/firewall_probe.py client 2001:db8::49 
 ip link set probe-s name tailscale0
 nsenter -t "$client_pid" -n python3 tests/firewall_probe.py client 100.64.0.2 open
 ip link set tailscale0 name probe-s
+# Aplica las órdenes generadas, con nft real y la configuración nativa que
+# contiene flush ruleset. El caso de reinicio ejecuta también la fase Stop.
+apply_native() {
+  local operation="$1" command
+  while IFS= read -r command; do
+    [[ -z "$command" ]] || $command || return 1
+    fw_active || return 1
+    nft list table inet unrelated >/dev/null || return 1
+  done < <(sed -n "s/^Exec$operation=//p" "$FW_NFTABLES_DROPIN")
+}
+[[ -s "$FW_NFTABLES_DROPIN" ]]
+apply_native Reload
+apply_native Stop
+apply_native Start
+nsenter -t "$client_pid" -n python3 tests/firewall_probe.py client 198.51.100.2 blocked
+# Esta tabla existe solo en ejecución, fuera de la configuración de nftables.
+nft add table inet runtime_only
+
+# Cambia a las reglas de AdGuard para probar el puerto HTTP/3 en UDP real.
+ENGINE=adguard
+AGH_YAML="$task_dir/AdGuardHome.yaml"
+AGH_READY=1
+printf 'dns:\n  serve_http3: true # DoH3\ntls:\n  enabled: true # TLS\n  port_https: 443\n' > "$AGH_YAML"
+install_firewall_quiet
+nsenter -t "$client_pid" -n python3 tests/firewall_probe.py client 192.168.1.49 open http3
+nsenter -t "$client_pid" -n python3 tests/firewall_probe.py client 198.51.100.2 blocked http3
+ENGINE=pihole
 install_firewall_quiet
 [[ $(nft list table inet nexo_dns | grep -c 'tcp dport') == 1 ]]
 fw_prepare_port_change 9443 tcp
@@ -89,6 +168,13 @@ nft list table inet nexo_dns | grep -q '9443'
 old_saved=$(sha256sum "$FW_NFT")
 old_live=$(nft -s list table inet nexo_dns)
 WEB_TEST='9443s'
+# Los respaldos se leen y verifican antes de mutar archivos o reglas.
+if (cp() { return 1; }; install_firewall_quiet); then
+  echo 'ERROR: aceptó copia previa fallida'
+  exit 1
+fi
+[[ $(sha256sum "$FW_NFT") == "$old_saved" ]]
+[[ $(nft -s list table inet nexo_dns) == "$old_live" ]]
 DNS_TEST=fail
 DNS_CALLS=0
 if install_firewall_quiet; then echo 'ERROR: aceptó DNS fallido'; exit 1; fi
@@ -111,4 +197,5 @@ SYSTEMD_TEST=ok
 WEB_TEST='22'
 if install_firewall_quiet; then echo 'ERROR: aceptó conflicto con SSH'; exit 1; fi
 [[ $(nft -s list table inet nexo_dns) == "$old_live" ]]
+nft list table inet runtime_only >/dev/null
 echo 'PASS: carga real, HTTPS, Tailscale, idempotencia, rollback, SSH y tablas ajenas'
