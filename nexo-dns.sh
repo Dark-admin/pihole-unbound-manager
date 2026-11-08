@@ -3,7 +3,7 @@
 #  nexo-dns.sh — Instalador y panel de DNS privado
 #  Pi-hole o AdGuard Home + Unbound + Tailscale
 #
-#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.4
+#  Autor: nexo (Dᵃʳᵏ- ᵃᵈᵐᶤᶰ)   ·   v4.5
 #  Compatible: Raspberry Pi OS · Debian 11+ · Ubuntu 20.04+ · VPS
 #
 #  Uso:
@@ -13,6 +13,7 @@
 #     sudo bash nexo-dns.sh health       → chequeo con pruebas reales
 #     sudo bash nexo-dns.sh audit        → auditoría de seguridad sin cambios
 #     sudo bash nexo-dns.sh optimize     → reaplica la optimización
+#     bash nexo-dns.sh bench --json      → mide latencia del filtro y Unbound
 #     sudo bash nexo-dns.sh security     → qué hay expuesto a internet
 #     sudo bash nexo-dns.sh firewall     → cierra el DNS al mundo
 #     sudo bash nexo-dns.sh engine       → cambia entre Pi-hole y AdGuard Home
@@ -38,7 +39,7 @@ fi
 
 # OJO: no llamarla VERSION. /etc/os-release define VERSION y al leerlo
 # machacaría la nuestra ("nexo-dns v13 (trixie)").
-NEXO_VERSION="4.4"
+NEXO_VERSION="4.5"
 CONF=/etc/nexo-dns.conf
 UNBOUND_CONF=/etc/unbound/unbound.conf.d/pi-hole.conf
 PIHOLE_TOML=/etc/pihole/pihole.toml
@@ -597,6 +598,40 @@ acquire_lock() {
 # Sin esto, el estado mostraba el error crudo donde debía ir la IP.
 dig_short() { dig +short "$@" 2>/dev/null | grep -v '^;;' | head -1; }
 
+valid_dns_name() {
+  local name=${1%.} label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+  [[ ${#name} -le 253 && "$name" =~ ^$label(\.$label)+$ ]]
+}
+
+dns_query() {
+  local server=$1 port=$2 name=$3 type=$4
+  shift 4
+  LC_ALL=C dig -r +time=3 +tries=1 +noall +comments +answer +stats \
+    "@$server" -p "$port" -q "$name" -t "$type" "$@"
+}
+
+dns_rcode() {
+  awk -F 'status: ' '/^;; ->>HEADER<<-/ && NF > 1 {split($2, fields, /[^A-Z0-9]/); print fields[1]; exit}'
+}
+
+dns_answer_has_record() {
+  awk -v type="$1" -v public_only="${2:-0}" '
+    $0 !~ /^;/ && $3=="IN" && $4==type && NF>=5 {
+      if (type=="A" && ($5 !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || $5=="0.0.0.0" || $5 ~ /^127\./)) next
+      if (type=="A" && public_only) {
+        split($5, octet, ".")
+        if (octet[1]==0 || octet[1]==10 || octet[1]>=224 ||
+            (octet[1]==100 && octet[2]>=64 && octet[2]<=127) ||
+            (octet[1]==169 && octet[2]==254) ||
+            (octet[1]==172 && octet[2]>=16 && octet[2]<=31) ||
+            (octet[1]==192 && octet[2]==168)) next
+      }
+      if (type=="AAAA" && ($5 !~ /^[0-9a-fA-F:.]+$/ || $5 !~ /:/ || $5=="::" || $5=="::1")) next
+      found=1
+    }
+    END {exit !found}'
+}
+
 # ══════════════════════════════════════════════════════ detección de SO ════════
 OS_ID=""; OS_NAME=""; MODEL=""
 detect_os() {
@@ -688,21 +723,23 @@ resolved_conflicts() {
 }
 
 fix_resolved() {
+  local dropin=${1:-/etc/systemd/resolved.conf.d/no-stub.conf} resolv_conf=${2:-/etc/resolv.conf}
   step "Liberando el puerto 53 de systemd-resolved"
-  mkdir -p /etc/systemd/resolved.conf.d
-  cat > /etc/systemd/resolved.conf.d/no-stub.conf <<'EOF'
+  mkdir -p -- "$(dirname -- "$dropin")" || return 1
+  cat > "$dropin" <<'EOF' || return 1
 # Cede el puerto 53 a Pi-hole. systemd-resolved sigue funcionando como
 # resolvedor local para el propio sistema, solo deja de abrir el stub.
 [Resolve]
 DNSStubListener=no
 EOF
   # /etc/resolv.conf apunta al stub; hay que llevarlo al fichero real.
-  if [[ -L /etc/resolv.conf ]] && [[ "$(readlink -f /etc/resolv.conf)" == *stub-resolv.conf ]]; then
-    ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  if [[ -L "$resolv_conf" ]] && [[ "$(readlink -f "$resolv_conf")" == *stub-resolv.conf ]]; then
+    ln -sfn -- /run/systemd/resolve/resolv.conf "$resolv_conf" || return 1
     ok "/etc/resolv.conf reapuntado fuera del stub"
   fi
-  systemctl restart systemd-resolved
-  sleep 2
+  if ! systemctl restart systemd-resolved || ! systemctl is-active --quiet systemd-resolved; then
+    err "systemd-resolved no quedó activo"; return 1
+  fi
   if resolved_conflicts; then
     err "El puerto 53 sigue ocupado por systemd-resolved"
     return 1
@@ -736,6 +773,42 @@ ph_set() {
 
 # ═══════════════════════════════════════════════════════ AdGuard Home ══════════
 AGH_PRESENT=0; AGH_VER=""; AGH_READY=0
+agh_has_admin() {
+  # El YAML generado por AdGuard usa listas con guiones a nivel de la clave.
+  # Se acepta también el formato indentado del ejemplo oficial.
+  awk '
+    function scalar(s) {
+      sub(/^[^:]*:[[:space:]]*/, "", s)
+      sub(/[[:space:]]+#.*$/, "", s)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+      if (s ~ /^".*"$/ || (substr(s, 1, 1) == q && substr(s, length(s)) == q))
+        s = substr(s, 2, length(s) - 2)
+      return s
+    }
+    function finish() {
+      if (user) {
+        count++
+        if (name == "" || name == "~" || name == "null" ||
+            password !~ /^\$2[aby]\$[0-9][0-9]\$[.\/A-Za-z0-9]+$/ ||
+            length(password) != 60 || substr(password, 5, 2) + 0 < 4 ||
+            substr(password, 5, 2) + 0 > 31)
+          invalid = 1
+      }
+      user = 0
+    }
+    BEGIN { q = sprintf("%c", 39) }
+    /^users:[[:space:]]*(#.*)?$/ { finish(); inusers = 1; next }
+    /^[A-Za-z_][A-Za-z0-9_]*:/ { finish(); inusers = 0; next }
+    !inusers { next }
+    /^[ ]*(-[ ]+|[ ]+)(name|password):/ {
+      if ($0 ~ /^[ ]*-/) { finish(); user = 1; name = ""; password = "" }
+      if ($0 ~ /^[ ]*(-[ ]+|[ ]+)name:/) name = scalar($0)
+      else password = scalar($0)
+    }
+    END { finish(); exit !(count > 0 && !invalid) }
+  ' "$AGH_YAML"
+}
+
 detect_adguard() {
   AGH_PRESENT=0; AGH_VER=""; AGH_READY=0
   [[ -x "$AGH_BIN" ]] || return 0
@@ -744,8 +817,7 @@ detect_adguard() {
   # El asistente web es quien crea el usuario admin. Hasta pasar por él, el YAML
   # no tiene bloque `users:` y AdGuard sigue en modo instalación escuchando solo
   # en el 3000: está vivo pero no resuelve ni filtra nada.
-  if [[ -f "$AGH_YAML" ]] && grep -qE '^users:' "$AGH_YAML" \
-     && ! grep -qE '^users:[[:space:]]*\[\]' "$AGH_YAML"; then
+  if [[ -f "$AGH_YAML" ]] && agh_has_admin; then
     AGH_READY=1
   fi
   return 0
@@ -760,26 +832,31 @@ agh_put() {
   local blk="$1" key="$2"; shift 2
   local repl; repl=$(printf '%s\n' "$@")
   [[ -f "$AGH_YAML" ]] || { err "No existe $AGH_YAML"; return 1; }
-  local tmp; tmp=$(mktemp) || return 1
+  local path tmp
+  path=$(realpath -e -- "$AGH_YAML") || return 1
+  tmp=$(mktemp "$path.XXXXXX") || return 1
+  cp -p -- "$path" "$tmp" || { rm -f -- "$tmp"; return 1; }
   awk -v blk="$blk" -v key="$key" -v repl="$repl" '
-    BEGIN { inblk=0; done=0; skip=0 }
     {
       if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*:/) {
         if (inblk && !done) { print repl; done=1 }
-        inblk = ($0 ~ "^" blk ":") ? 1 : 0
+        inblk = ($0 ~ "^" blk ":[[:space:]]*(#.*)?$") ? 1 : 0
         skip=0; print; next
       }
       if (inblk && !done && $0 ~ "^  " key ":") {
         print repl; done=1; skip=1; next   # skip: tragar la lista o mapa viejo
       }
-      if (skip) { if ($0 ~ /^    /) next; skip=0 }
+      if (skip) { if ($0 ~ /^    |^  -([[:space:]]|$)/) next; skip=0 }
       print
     }
-    END { if (inblk && !done) print repl }
-  ' "$AGH_YAML" > "$tmp" || { rm -f "$tmp"; return 1; }
-  # Un fichero vacío significa que awk falló: no pisar la config buena.
-  [[ -s "$tmp" ]] || { err "El editor de YAML devolvió un fichero vacío"; rm -f "$tmp"; return 1; }
-  cat "$tmp" > "$AGH_YAML" && rm -f "$tmp"
+    END {
+      if (inblk && !done) { print repl; done=1 }
+      if (!done) exit 1
+    }
+  ' "$path" > "$tmp" && mv -fT -- "$tmp" "$path" && return 0
+  rm -f -- "$tmp"
+  err "No se pudo editar el bloque $blk del YAML de AdGuard"
+  return 1
 }
 
 agh_set() { agh_put "$1" "$2" "  $2: $3"; }
@@ -793,7 +870,11 @@ agh_get() {   # $1 bloque · $2 clave
   [[ -f "$AGH_YAML" ]] || return 1
   awk -v blk="$1" -v key="$2" '
     /^[A-Za-z_][A-Za-z0-9_]*:/ { inblk = ($0 ~ "^" blk ":") ? 1 : 0; next }
-    inblk && $0 ~ "^  " key ":" { sub("^  " key ":[ ]*", ""); print; exit }
+    inblk && $0 ~ "^  " key ":" {
+      sub("^  " key ":[[:space:]]*", "")
+      if ($0 ~ /^#/) $0=""
+      sub(/[[:space:]]+#.*$/, ""); sub(/[[:space:]]+$/, ""); print; exit
+    }
   ' "$AGH_YAML"
 }
 agh_block_list() {   # igual que agh_get pero para claves lista, una por línea
@@ -803,7 +884,7 @@ agh_block_list() {   # igual que agh_get pero para claves lista, una por línea
     !inblk { next }
     $0 ~ "^  " key ":" { inkey=1; next }
     inkey {
-      if ($0 ~ /^    - /) { sub(/^    - /, ""); print; next }
+      if ($0 ~ /^  (  )?- /) { sub(/^  (  )?- /, ""); print; next }
       if ($0 ~ /^  /) { inkey=0 }
     }
   ' "$AGH_YAML"
@@ -910,12 +991,16 @@ load_conf() {
   elif [[ $PH_MAJOR -ge 6 ]]; then
     local q w
     q=$(ph_get dns.port);        [[ "$q" =~ ^[0-9]+$ ]] && PIHOLE_PORT="$q"
-    w=$(ph_get webserver.port | grep -oE '^[0-9]+' | head -1); [[ "$w" =~ ^[0-9]+$ ]] && WEB_PORT="$w"
+    w=$(ph_get webserver.port); w=${w%%,*}; w=${w##*:}; w=${w//\"/}; w=${w#+}
+    w=${w%%[^0-9]*}; valid_port "$w" && WEB_PORT="$w"
   fi
 }
 
 save_conf() {
-  cat > "$CONF" <<EOF
+  local path="$CONF" tmp
+  if [[ -e "$CONF" ]]; then path=$(realpath -e -- "$CONF") || return 1; fi
+  tmp=$(mktemp "$path.XXXXXX") || return 1
+  if cat > "$tmp" <<EOF
 # Generado por nexo-dns.sh v$NEXO_VERSION — $(date '+%Y-%m-%d %H:%M')
 ENGINE=$ENGINE
 LISTEN_IP=$LISTEN_IP
@@ -923,18 +1008,25 @@ PIHOLE_PORT=$PIHOLE_PORT
 UNBOUND_PORT=$UNBOUND_PORT
 WEB_PORT=$WEB_PORT
 EOF
-  chmod 644 "$CONF"
+  then
+    chmod 644 "$tmp" && mv -fT -- "$tmp" "$path" && return 0
+  fi
+  rm -f -- "$tmp"
+  return 1
 }
 
 backup_now() {
-  local d
-  d="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
-  install -d -m 700 "$BACKUP_ROOT" "$d"
-  [[ -f "$UNBOUND_CONF" ]] && cp -a "$UNBOUND_CONF" "$d/"
-  [[ -f "$PIHOLE_TOML"  ]] && cp -a "$PIHOLE_TOML"  "$d/"
-  [[ -f "$AGH_YAML"     ]] && cp -a "$AGH_YAML"     "$d/"
-  [[ -f "$CONF"         ]] && cp -a "$CONF"         "$d/"
-  chmod -R go-rwx "$d"
+  local d f
+  install -d -m 700 "$BACKUP_ROOT" || return 1
+  d=$(mktemp -d "$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S).XXXXXX") || return 1
+  for f in "$UNBOUND_CONF" "$PIHOLE_TOML" "$AGH_YAML" "$CONF"; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    if [[ ! -f "$f" ]] || ! cp -p -- "$f" "$d/"; then
+      rm -f -- "$d/"*
+      rmdir -- "$d"
+      return 1
+    fi
+  done
   echo "$d"
 }
 
@@ -969,6 +1061,32 @@ detect_hw() {
 }
 
 # ═════════════════════════════════════════════════════ CONFIG DE UNBOUND ═══════
+OPT_REFERRAL=""; OPT_MIN_TTL=""
+
+unbound_min_ttl() {
+  local value
+  value=$(awk '$1=="cache-min-ttl:" && $2 ~ /^[0-9]+$/ && $2<=120 {value=$2+0; found=1} END {if (found) print value}' \
+    "$UNBOUND_CONF" 2>/dev/null) || value=""
+  printf '%s\n' "${value:-120}"
+}
+
+parse_optimize_args() {
+  while (( $# )); do
+    case "$1:${2:-}" in
+      --referral:standard) OPT_REFERRAL=no ;;
+      --referral:extra) OPT_REFERRAL=yes ;;
+      --min-ttl:*)
+        if [[ "${2:-}" =~ ^[0-9]{1,3}$ ]] && (( 10#$2 <= 120 )); then
+          OPT_MIN_TTL=$((10#$2))
+        else
+          err "--min-ttl requiere segundos entre 0 y 120" >&2; return 2
+        fi ;;
+      *) err "Uso: optimize [--referral standard|extra] [--min-ttl 0..120]" >&2; return 2 ;;
+    esac
+    shift 2
+  done
+}
+
 find_root_hints() {
   local f
   for f in /usr/share/dns/root.hints /var/lib/unbound/root.hints /etc/unbound/root.hints; do
@@ -995,7 +1113,12 @@ find_root_hints() {
 
 write_unbound_conf() {
   detect_hw
-  local hints hints_line
+  local hints hints_line referral="" min_ttl
+  if [[ -r "$UNBOUND_CONF" ]]; then
+    referral=$(awk '$1=="harden-referral-path:" && $2 ~ /^(yes|no)$/ {value=$2} END {print value}' "$UNBOUND_CONF")
+  fi
+  referral=${OPT_REFERRAL:-${referral:-yes}}
+  min_ttl=${OPT_MIN_TTL:-$(unbound_min_ttl)}
   hints=$(find_root_hints)
   if [[ -n "$hints" ]]; then
     hints_line="    root-hints: \"$hints\""
@@ -1009,7 +1132,7 @@ write_unbound_conf() {
     anchor_line='    # auto-trust-anchor-file ya lo declara otro fichero de unbound.conf.d/'
   fi
 
-  cat > "$UNBOUND_CONF" <<EOF
+  cat > "$UNBOUND_CONF" <<EOF || return 1
 ###############################################################################
 #  Unbound como resolver recursivo para Pi-hole
 #  Generado por nexo-dns.sh v$NEXO_VERSION el $(date '+%Y-%m-%d %H:%M')
@@ -1021,6 +1144,7 @@ server:
     # Solo localhost: quien pregunta es Pi-hole, en la misma máquina. Fijarlo
     # evita acabar exponiendo un resolver recursivo abierto sin querer.
     interface: 127.0.0.1
+    interface-automatic: no
     port: $UNBOUND_PORT
     do-ip4: yes
     do-ip6: no
@@ -1041,7 +1165,9 @@ server:
     harden-glue: yes
     harden-dnssec-stripped: yes
     harden-below-nxdomain: yes
-    harden-referral-path: yes
+    # Perfil extra: consultas de infraestructura adicionales. El estándar
+    # mantiene DNSSEC con validator e iterator y evita esas consultas extra.
+    harden-referral-path: $referral
     harden-algo-downgrade: no
     unwanted-reply-threshold: 10000000
     # Responde NXDOMAIN desde caché con NSEC ya validados: menos tráfico fuera.
@@ -1095,7 +1221,7 @@ server:
     ### TTLs ##################################################################
     # 120 y no más: los CDN usan TTLs de 30-60 s para balancear y hacer
     # failover. Forzarlos a una hora te deja clavado en una IP muerta.
-    cache-min-ttl: 120
+    cache-min-ttl: $min_ttl
     cache-max-ttl: 86400
     serve-expired: yes
     serve-expired-ttl: 3600
@@ -1110,8 +1236,19 @@ remote-control:
     control-enable: yes
     control-interface: /run/unbound.ctl
 EOF
-  chmod 644 "$UNBOUND_CONF"
+  chmod 644 "$UNBOUND_CONF" || return 1
   prune_unsupported
+}
+
+unbound_reload_if_compatible() {
+  local previous="$1" before after
+  [[ -r "$previous" ]] && need unbound-control && need timeout && systemctl is-active --quiet unbound || return 1
+  # Una diferencia en escucha, cachés, hilos o cualquier otra directiva exige
+  # reinicio. Solo se ignoran comentarios y estas dos opciones del perfil.
+  local omit='/^[[:space:]]*(#|$)/d; /^[[:space:]]*(harden-referral-path|cache-min-ttl):/d'
+  before=$(sed -E "$omit" "$previous") && after=$(sed -E "$omit" "$UNBOUND_CONF") || return 1
+  [[ -n "$before" && "$before" == "$after" ]] || return 1
+  timeout 8 unbound-control reload_keep_cache
 }
 
 prune_unsupported() {
@@ -1130,37 +1267,21 @@ prune_unsupported() {
   return 0
 }
 
-restore_unbound() {
-  local d="$1"
-  if [[ -f "$d/pi-hole.conf" ]]; then
-    cp -a "$d/pi-hole.conf" "$UNBOUND_CONF"
-  else
-    # En una instalación nueva no había configuración anterior. Dejar el
-    # fichero recién generado después de fallar no sería una reversión real.
-    rm -f "$UNBOUND_CONF"
-  fi
-  systemctl restart unbound 2>/dev/null || true
-  warn "Revertido desde $d"
-}
-
-restore_pihole() {
-  local d="$1"
-  [[ -f "$d/pihole.toml" ]] || return 0
-  cp -a "$d/pihole.toml" "$PIHOLE_TOML"
-  systemctl restart pihole-FTL 2>/dev/null || true
-}
-
 apply_unbound() {
-  local bkdir="$1"
   if ! unbound-checkconf >/dev/null 2>&1; then
     err "Configuración inválida:"; unbound-checkconf 2>&1 | sed 's/^/    /'
-    restore_unbound "$bkdir"; return 1
+    return 1
   fi
-  systemctl restart unbound || { restore_unbound "$bkdir"; return 1; }
+  if [[ "${1:-}" == optimize && -n "${txn_dir:-}" ]] &&
+      unbound_reload_if_compatible "$txn_dir/${UNBOUND_CONF##*/}"; then
+    info "Recarga compatible de Unbound con conservación de caché"
+  else
+    systemctl restart unbound || return 1
+  fi
   sleep 3
-  systemctl is-active --quiet unbound || { err "Unbound no arranca"; restore_unbound "$bkdir"; return 1; }
+  systemctl is-active --quiet unbound || { err "Unbound no arranca"; return 1; }
   dns_healthy "$UNBOUND_PORT" \
-    || { err "Unbound no resuelve en el puerto $UNBOUND_PORT"; restore_unbound "$bkdir"; return 1; }
+    || { err "Unbound no resuelve en el puerto $UNBOUND_PORT"; return 1; }
 
   local ad bad
   ad=$(dig +dnssec cloudflare.com @127.0.0.1 -p "$UNBOUND_PORT" +time=5 +tries=2 2>/dev/null | grep -c ' ad;')
@@ -1170,7 +1291,6 @@ apply_unbound() {
   else
     err "DNSSEC no valida como debería (ad=$ad servfail=$bad)"
     err "Se revierte para no dejar activo un resolver sin validación comprobada"
-    restore_unbound "$bkdir"
     return 1
   fi
   ok "Unbound activo en 127.0.0.1#$UNBOUND_PORT"
@@ -1203,17 +1323,48 @@ configure_pihole() {
     err "Pi-hole no quedó activo después de configurarlo"
     return 1
   }
+  local upstream pid setting
+  upstream=$(ph_get dns.upstreams) || return 1
+  upstream=${upstream//[[:space:]]/}
+  if [[ "$upstream" != "[\"127.0.0.1#$UNBOUND_PORT\"]" && "$upstream" != "[127.0.0.1#$UNBOUND_PORT]" ]]; then
+    err "Pi-hole no tiene a Unbound como único upstream"; return 1
+  fi
+  pid=$(systemctl show -p MainPID --value pihole-FTL 2>/dev/null) || pid=""
+  if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/environ" ]]; then
+    while IFS= read -r -d '' setting; do
+      case "$setting" in
+        "FTLCONF_dns_upstreams=127.0.0.1#$UNBOUND_PORT") ;;
+        FTLCONF_dns_upstreams=*) err "El entorno del servicio Pi-hole redefine sus upstreams"; return 1 ;;
+      esac
+    done < "/proc/$pid/environ"
+  fi
+  return 0
 }
 
-# Simétrico a restore_pihole: devuelve el YAML de una copia y reinicia. Se para
-# el servicio antes de escribir porque AdGuard reescribe su fichero al salir y
-# se llevaría por delante lo que acabamos de copiar.
-restore_adguard() {
-  local d="$1"
-  [[ -f "$d/AdGuardHome.yaml" ]] || return 0
-  systemctl stop "$AGH_SVC" 2>/dev/null || true
-  cp -a "$d/AdGuardHome.yaml" "$AGH_YAML"
-  systemctl start "$AGH_SVC" 2>/dev/null || true
+agh_validate_config() {
+  "$AGH_BIN" --check-config --no-check-update --no-permcheck \
+    --config "$AGH_YAML" --work-dir "$AGH_DIR" >/dev/null 2>&1 || {
+    err "AdGuard Home rechazó el YAML"
+    return 1
+  }
+}
+
+agh_no_client_upstreams() {
+  # No borrar reglas del usuario. Si hay upstreams por cliente, hay que
+  # resolverlos explícitamente antes de garantizar un único resolver local.
+  awk '
+    { sub(/[[:space:]]+#.*$/, ""); sub(/[[:space:]]+$/, "") }
+    /^[^[:space:]#-]/ {
+      section=($0 ~ /^["\047]?clients["\047]?[[:space:]]*:/)
+      if (section && $0 !~ /:[[:space:]]*(\{\}|null|~)?$/) unsafe=1
+      next
+    }
+    section && /^[[:space:]]+(-[[:space:]]+)?["\047]?upstreams["\047]?[[:space:]]*:/ {
+      sub(/^[^:]*:[[:space:]]*/, "")
+      if ($0 !~ /^(\[[[:space:]]*\]|null|~)$/) unsafe=1
+    }
+    END {exit unsafe}
+  ' "$AGH_YAML"
 }
 
 # El mismo criterio que configure_pihole, traducido al YAML de AdGuard. Devuelve
@@ -1224,6 +1375,10 @@ configure_adguard() {
   if (( ! AGH_READY )); then
     warn "AdGuard está instalado pero sin pasar el asistente web."
     warn "Abre http://$LISTEN_IP:3000 , crea tu usuario y vuelve aquí."
+    return 1
+  fi
+  if ! agh_no_client_upstreams; then
+    err "AdGuard tiene upstreams por cliente. Revísalos antes de aplicar el upstream único"
     return 1
   fi
   if (( RAM_MB <= 700 )); then
@@ -1245,12 +1400,12 @@ configure_adguard() {
   # es justo lo que impide que te usen de amplificador.
   local rl=0; (( IS_VPS )) && rl=20
 
-  local was_active=0
-  systemctl is-active --quiet "$AGH_SVC" 2>/dev/null && was_active=1
-  (( was_active )) && systemctl stop "$AGH_SVC"
+  # AdGuard escribe el YAML al parar. Toda edición va después del stop.
+  systemctl stop "$AGH_SVC" || return 1
 
   local failed=0
   agh_set_list dns upstream_dns "127.0.0.1:$UNBOUND_PORT" || failed=1
+  agh_set dns upstream_dns_file '""' || failed=1
   # Sin bootstrap ni fallback: el upstream es una IP local, no hay nada que
   # resolver para llegar a él. Un respaldo público sería una puerta trasera que
   # se saltaría a Unbound —y al filtrado— en cuanto Unbound tosiera.
@@ -1258,7 +1413,8 @@ configure_adguard() {
   agh_put dns fallback_dns  "  fallback_dns: []"  || failed=1
   agh_set dns enable_dnssec false     || failed=1   # ya valida Unbound
   agh_set dns cache_size "$cache"     || failed=1
-  agh_set dns cache_ttl_min 120       || failed=1   # mismo suelo que Unbound
+  local min_ttl; min_ttl=$(unbound_min_ttl)
+  agh_set dns cache_ttl_min "$min_ttl" || failed=1   # mismo suelo que Unbound
   agh_set dns cache_ttl_max 86400     || failed=1
   agh_set dns cache_optimistic true   || failed=1   # equivale a serve-expired
   agh_set dns refuse_any true         || failed=1   # ANY amplifica x54
@@ -1270,30 +1426,13 @@ configure_adguard() {
       "    use_custom: false" || failed=1
   agh_set dns use_private_ptr_resolvers false || failed=1
   agh_put dns local_ptr_upstreams "  local_ptr_upstreams: []" || failed=1
-  agh_set_list dns bind_hosts "0.0.0.0" || failed=1
   agh_set dns port "$PIHOLE_PORT"       || failed=1
-
-  # AdGuard escribe CADA consulta al querylog y de fábrica guarda 90 días: en
-  # una Raspberry con SD son cientos de miles de escrituras diarias sobre la
-  # pieza más frágil. Se recorta el historial pero NO se desactiva el fichero,
-  # porque de ahí leen el precalentado de caché y el panel web.
-  # El formato del intervalo cambió entre versiones (antes días, ahora "2160h"),
-  # así que se respeta el que ya tenga puesto.
-  local qi si dias_q=3 dias_s=30
-  (( RAM_MB <= 600 )) && dias_q=1
-  qi=$(agh_get querylog interval)
-  si=$(agh_get statistics interval)
-  if   [[ "$qi" == *h* ]]; then agh_set querylog interval "$(( dias_q * 24 ))h" || failed=1
-  elif [[ -n "$qi"    ]]; then agh_set querylog interval "$dias_q"              || failed=1; fi
-  if   [[ "$si" == *h* ]]; then agh_set statistics interval "$(( dias_s * 24 ))h" || failed=1
-  elif [[ -n "$si"    ]]; then agh_set statistics interval "$dias_s"              || failed=1; fi
-  agh_set querylog file_enabled true || failed=1
 
   if (( failed )); then
     err "No se pudieron aplicar todos los ajustes de AdGuard Home"
-    (( was_active )) && systemctl start "$AGH_SVC" 2>/dev/null
     return 1
   fi
+  agh_validate_config || return 1
 
   systemctl start "$AGH_SVC" 2>/dev/null || {
     err "AdGuard Home no se pudo arrancar tras configurarlo"
@@ -1305,20 +1444,14 @@ configure_adguard() {
     return 1
   }
   ok "AdGuard apuntando a Unbound 127.0.0.1:$UNBOUND_PORT"
-  echo "     caché $((cache/1048576)) MB · TTL 120-86400 · optimista · DNSSEC delegado en Unbound"
+  echo "     caché $((cache/1048576)) MB · TTL $min_ttl-86400 · optimista · DNSSEC delegado en Unbound"
   (( rl == 0 )) && echo "     sin límite por cliente (red doméstica)" \
                 || echo "     límite de $rl consultas/s por cliente (máquina expuesta)"
-  echo "     historial $dias_q día(s) y estadísticas $dias_s días, para no castigar la SD"
 }
 
 # Punto único: quien llame no necesita saber qué motor hay debajo.
 configure_engine() {
   if [[ "$ENGINE" == adguard ]]; then configure_adguard; else configure_pihole; fi
-}
-
-# Devuelve la config del motor activo desde una copia de seguridad.
-restore_engine() {
-  if [[ "$ENGINE" == adguard ]]; then restore_adguard "$1"; else restore_pihole "$1"; fi
 }
 
 # Deja el 53 libre parando y DESHABILITANDO el servicio que lo tenga. Solo
@@ -1327,8 +1460,211 @@ restore_engine() {
 stop_engine_svc() {
   local svc="$1"
   systemctl cat "$svc" >/dev/null 2>&1 || return 0
-  systemctl disable --now "$svc" >/dev/null 2>&1 || systemctl stop "$svc" >/dev/null 2>&1 || true
-  sleep 1
+  systemctl stop "$svc" && systemctl disable "$svc" >/dev/null 2>&1
+}
+
+# El subproceso aísla las variables de configuración. El menú las vuelve a
+# leer del disco después de cada operación.
+dns_transaction() (
+  local services="$1" action="$2"; shift 2
+  local txn_dir txn_fw=0 txn_fw_changed=0 txn_conf_changed=0 txn_keep_new=0
+  local txn_resolved=0 resolved_dropin=/etc/systemd/resolved.conf.d/no-stub.conf
+  local resolver_conf=/etc/resolv.conf svc
+  local -A txn_enabled=() txn_active=() txn_services=() txn_files=()
+  txn_dir=$(backup_now) || { err "No se pudo guardar una copia previa"; exit 1; }
+  info "Copia en $txn_dir"
+  for svc in $services; do
+    txn_enabled[$svc]=$(systemctl is-enabled "$svc" 2>/dev/null) || true
+    txn_active[$svc]=0
+    if systemctl is-active --quiet "$svc"; then txn_active[$svc]=1; fi
+  done
+  if fw_active; then
+    mkdir "$txn_dir/firewall" && fw_snapshot "$txn_dir/firewall" || exit 1
+    txn_fw=1
+  elif [[ -e "$FW_NFT" || -e "$FW_UNIT" || -e "$FW_NFTABLES_DROPIN" ]]; then
+    err "El firewall de Nexo está configurado, pero falta su tabla activa. Reaplica el firewall antes de cambiar servicios"
+    exit 1
+  fi
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'rc=$?; trap "" INT TERM; (( rc == 0 )) || dns_rollback; exit "$rc"' EXIT
+  "$action" "$@"
+  exit "$?"
+)
+
+dns_restore_file() {
+  local path="$1" previous="$2"
+  if [[ -f "$previous" ]]; then
+    cp -p -- "$previous" "$path"
+  else
+    rm -f -- "$path"
+  fi
+}
+
+dns_restore_enable() {
+  local svc="$1" before="$2" current
+  systemctl cat "$svc" >/dev/null 2>&1 || return 0
+  current=$(systemctl is-enabled "$svc" 2>/dev/null) || true
+  [[ "$current" == "$before" ]] && return 0
+  case "$current" in
+    masked) systemctl unmask "$svc" || return 1 ;;
+    masked-runtime) systemctl unmask --runtime "$svc" || return 1 ;;
+    enabled) systemctl disable "$svc" || return 1 ;;
+    enabled-runtime) systemctl disable --runtime "$svc" || return 1 ;;
+  esac
+  case "$before" in
+    enabled) systemctl enable "$svc" ;;
+    enabled-runtime) systemctl enable --runtime "$svc" ;;
+    masked) systemctl mask "$svc" ;;
+    masked-runtime) systemctl mask --runtime "$svc" ;;
+    ''|not-found|disabled|static|indirect|generated|transient) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+dns_rollback() {
+  local svc path failed=0 firewall_ok=1
+  for svc in pihole-FTL "$AGH_SVC" unbound; do
+    # Stop cancela un auto-restart pendiente, aunque aún no marque active.
+    if [[ -v txn_services[$svc] ]] && systemctl cat "$svc" >/dev/null 2>&1; then
+      systemctl stop "$svc" || failed=1
+    fi
+  done
+  for path in "$UNBOUND_CONF" "$PIHOLE_TOML" "$AGH_YAML"; do
+    [[ -v txn_files[$path] ]] || continue
+    if [[ "$path" == "$AGH_YAML" && -f "$txn_dir/after-wizard.yaml" ]]; then
+      dns_restore_file "$path" "$txn_dir/after-wizard.yaml" || failed=1
+      continue
+    fi
+    if (( txn_keep_new )) && [[ "$path" != "$UNBOUND_CONF" && ! -f "$txn_dir/${path##*/}" ]]; then
+      # Se conservan las credenciales y ajustes recién creados por un asistente.
+      continue
+    fi
+    dns_restore_file "$path" "$txn_dir/${path##*/}" || failed=1
+  done
+  if (( txn_conf_changed )); then
+    dns_restore_file "$CONF" "$txn_dir/${CONF##*/}" || failed=1
+  fi
+  if (( txn_resolved )); then
+    dns_restore_file "$resolved_dropin" "$txn_dir/resolved-stub" || failed=1
+    if [[ -L "$txn_dir/resolv-link" ]]; then
+      cp -aT -- "$txn_dir/resolv-link" "$resolver_conf" || failed=1
+    fi
+    systemctl restart systemd-resolved || failed=1
+  fi
+  if (( txn_fw_changed )) && ! fw_restore_snapshot "$txn_dir/firewall"; then
+    failed=1; firewall_ok=0
+    err "El filtro se queda detenido hasta recuperar las reglas de protección"
+  fi
+  for svc in unbound pihole-FTL "$AGH_SVC"; do
+    [[ -v txn_services[$svc] ]] || continue
+    dns_restore_enable "$svc" "${txn_enabled[$svc]}" || failed=1
+    if (( txn_active[$svc] )) && { (( firewall_ok )) || [[ "$svc" == unbound ]]; }; then
+      systemctl start "$svc" || failed=1
+    fi
+  done
+  if (( failed )); then
+    err "Reversión incompleta. Revisa los servicios y la copia en $txn_dir"
+  else
+    warn "Se restauró el estado anterior"
+  fi
+}
+
+dns_touch_service() {
+  txn_services[$1]=1
+  if [[ -n "${2:-}" ]]; then txn_files[$2]=1; fi
+}
+
+dns_touch_engine() {
+  if [[ "$ENGINE" == adguard ]]; then
+    dns_touch_service "$AGH_SVC" "$AGH_YAML"
+  else
+    dns_touch_service pihole-FTL "$PIHOLE_TOML"
+  fi
+}
+
+dns_restore_activity() {
+  local svc
+  for svc in "$@"; do
+    if [[ -v txn_services[$svc] ]] && (( ! txn_active[$svc] )); then
+      systemctl stop "$svc" || return 1
+    fi
+  done
+}
+
+dns_save_conf() {
+  txn_conf_changed=1
+  save_conf
+}
+
+dns_apply_engine() {
+  dns_touch_engine
+  configure_engine || return 1
+  dns_verify_engine "$PIHOLE_PORT"
+}
+
+dns_verify_engine() {
+  local port="$1"
+  if ! systemctl is-active --quiet "$(engine_svc)" || ! dns_healthy "$port"; then
+    err "$(engine_name) no resuelve en el puerto $port"
+    return 1
+  fi
+}
+
+dns_prepare_firewall_port() {
+  (( txn_fw )) || return 0
+  txn_fw_changed=1
+  fw_prepare_port_change "$@"
+}
+
+dns_finish_firewall() {
+  (( txn_fw_changed )) || return 0
+  install_firewall_quiet
+}
+
+dns_prepare_engine_firewall() {
+  (( txn_fw )) || return 0
+  local target="$1" ENGINE="$ENGINE" FW_PENDING_TCP FW_PENDING_UDP
+  engine_fw_ports || return 1
+  FW_PENDING_TCP="$FW_TCP"; FW_PENDING_UDP="$FW_UDP"
+  if [[ "$target" == adguard && ! -f "$AGH_YAML" ]]; then
+    FW_PENDING_TCP="$FW_PENDING_TCP,3000,80,443,8080,8443"
+  else
+    ENGINE="$target"
+  fi
+  txn_fw_changed=1
+  install_firewall_quiet prepare
+}
+
+dns_prepare_resolved() {
+  [[ "$PIHOLE_PORT" == 53 ]] && resolved_conflicts || return 0
+  warn "systemd-resolved está ocupando el puerto 53."
+  yes_no "¿Desactivo solo el stub de systemd-resolved?" || return 1
+  if [[ -e "$resolved_dropin" ]]; then
+    cp -p -- "$resolved_dropin" "$txn_dir/resolved-stub" || return 1
+  fi
+  if [[ -L "$resolver_conf" ]]; then
+    cp -a -- "$resolver_conf" "$txn_dir/resolv-link" || return 1
+  fi
+  txn_resolved=1
+  fix_resolved "$resolved_dropin" "$resolver_conf"
+}
+
+dns_read_engine_web_port() {
+  local address
+  if [[ "$ENGINE" == adguard ]]; then
+    address=$(agh_get http address) || return 1
+    address=${address//\"/}; address=${address//\'/}
+    address=${address##*:}
+  else
+    address=$(ph_get webserver.port) || return 1
+    address=${address%%,*}
+    address=${address##*:}
+    address=${address//\"/}
+    address=${address#+}
+    address=${address%%[^0-9]*}
+  fi
+  if valid_port "$address"; then WEB_PORT="$((10#$address))"; fi
 }
 
 # Descarga un instalador oficial con el mismo criterio para AdGuard y Tailscale:
@@ -1346,16 +1682,15 @@ fetch_and_run_installer() {   # $1 URL · $2 palabra esperada · $3... argumento
   fi
   hash=$(sha256sum "$f" | awk '{print $1}')
   info "SHA-256 del instalador descargado: $hash"
-  if ! sh "$f" "$@"; then rm -f "$f"; return 1; fi
+  if ! bash "$f" "$@"; then rm -f "$f"; return 1; fi
   rm -f "$f"
 }
 
 install_adguard() {
   clear_screen; step "Instalar AdGuard Home"
   detect_adguard; detect_pihole
-  if (( AGH_PRESENT )); then
+  if (( AGH_PRESENT && AGH_READY )); then
     ok "AdGuard Home ya está instalado${AGH_VER:+ ($AGH_VER)}"
-    (( AGH_READY )) || warn "Falta pasar el asistente web en http://$LISTEN_IP:3000"
     pause; return 0
   fi
   echo
@@ -1369,67 +1704,40 @@ install_adguard() {
     echo
   fi
   yes_no "¿Continuar?" || { info "Cancelado"; pause; return 0; }
-
-  step "1/4 · Descarga e instalación"
-  if ! fetch_and_run_installer \
-       "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh" \
-       "adguard" -v; then
-    err "Falló la instalación de AdGuard Home"; pause; return 1
-  fi
-  detect_adguard
-  (( AGH_PRESENT )) || { err "El binario no aparece en $AGH_BIN"; pause; return 1; }
-  ok "AdGuard Home ${AGH_VER:-instalado}"
-
-  step "2/4 · Liberar el puerto 53"
-  # do_install ya trata systemd-resolved en su paso 2, pero aquí se entra
-  # directo desde el panel: en Ubuntu, sin esto, AdGuard no puede atarse al 53.
-  if resolved_conflicts; then
-    warn "systemd-resolved está ocupando el puerto 53 (típico de Ubuntu)."
-    if yes_no "¿Desactivo solo el stub de systemd-resolved?"; then
-      fix_resolved || { err "No se pudo liberar el 53"; pause; return 1; }
-    else
-      err "Sin el puerto 53 libre AdGuard no podrá arrancar"; pause; return 1
-    fi
-  fi
-  if (( PH_MAJOR > 0 )) && systemctl is-active --quiet pihole-FTL 2>/dev/null; then
-    stop_engine_svc pihole-FTL
-    ok "Pi-hole parado y deshabilitado (sigue instalado)"
-  else
-    ok "El 53 ya estaba libre"
-  fi
-
-  step "3/4 · Asistente web"
-  echo
-  warn "Este paso lo haces tú en el navegador: AdGuard pide crear usuario y"
-  warn "contraseña, y este script no genera credenciales."
-  echo
-  echo "    1) Abre  ${BLD}http://$LISTEN_IP:3000${NC}"
-  echo "    2) Escucha DNS en ${BLD}todas${NC} las interfaces, puerto ${BLD}$PIHOLE_PORT${NC}"
-  echo "    3) Puerto del panel: ${BLD}$WEB_PORT${NC} (o el que prefieras)"
-  echo "    4) Crea tu usuario y termina"
-  echo
-  info "Cuando acabes, vuelve aquí y pulsa Enter."
+  local result=0
+  dns_transaction "pihole-FTL $AGH_SVC" dns_install_adguard || result=$?
   pause
+  return "$result"
+}
 
-  step "4/4 · Enlazar con Unbound y optimizar"
+dns_install_adguard() {
+  dns_prepare_engine_firewall adguard && dns_prepare_resolved || return 1
+  ENGINE=adguard
+  dns_install_filter || return 1
+  dns_activate_engine || return 1
+  ok "AdGuard Home listo"
+  echo "  Panel web : http://$LISTEN_IP:$WEB_PORT"
+  echo "  DNS       : $LISTEN_IP:$PIHOLE_PORT → Unbound 127.0.0.1#$UNBOUND_PORT"
+}
+
+dns_adguard_wizard() {
+  if (( AGH_READY )); then return 0; fi
+  systemctl start "$AGH_SVC" || return 1
+  step "Asistente web de AdGuard"
+  echo "    1) Abre http://$LISTEN_IP:3000"
+  echo "    2) Escoge la escucha DNS y el puerto $PIHOLE_PORT"
+  echo "    3) Escoge el puerto web $WEB_PORT y crea tu usuario"
+  yes_no "¿Terminaste el asistente y creaste el usuario?" || return 1
   detect_adguard
   if (( ! AGH_READY )); then
-    warn "El asistente aún no está terminado; no toco la configuración."
-    warn "Cuando lo acabes: panel → Reoptimizar."
-    pause; return 1
+    err "AdGuard aún no tiene un usuario con credenciales válidas"
+    return 1
   fi
-  ENGINE=adguard
-  local bk; bk=$(backup_now); info "Copia en $bk"
-  if configure_adguard; then
-    load_conf; save_conf
-    ok "AdGuard Home listo"
-    echo "  Panel web : http://$LISTEN_IP:$WEB_PORT"
-    echo "  DNS       : $LISTEN_IP:$PIHOLE_PORT → Unbound 127.0.0.1#$UNBOUND_PORT"
-  else
-    err "No se pudo configurar; se devuelve la copia previa"
-    restore_adguard "$bk"
+  if ! cp -p -- "$AGH_YAML" "$txn_dir/after-wizard.yaml"; then
+    unset 'txn_files[$AGH_YAML]'
+    rm -f -- "$txn_dir/after-wizard.yaml"
+    return 1
   fi
-  pause
 }
 
 # ═════════════════════════════════════════════════════════ CAMBIO DE MOTOR ═════
@@ -1450,57 +1758,41 @@ switch_engine() {
     else
       echo "  Instálalo con:  ${BLD}sudo bash $0 install${NC}"
     fi
-    pause; return 0
+    pause; return 1
   fi
   if [[ "$target" == adguard ]] && (( ! AGH_READY )); then
-    err "AdGuard no tiene el asistente terminado"; pause; return 0
+    err "AdGuard no tiene el asistente terminado"; pause; return 1
   fi
   warn "Los dos comparten el puerto $PIHOLE_PORT, así que el actual se para y se"
   warn "deshabilita. No se desinstala nada y se puede volver cuando quieras."
   echo
   yes_no "¿Cambiar a $tgt_n?" || return 0
 
-  local old_svc new_svc
-  if fw_active; then
-    engine_fw_ports || { pause; return 1; }
-    FW_PENDING_TCP="$FW_TCP"; FW_PENDING_UDP="$FW_UDP"
-    ENGINE="$target"
-    if ! install_firewall_quiet; then
-      ENGINE="$prev"; FW_PENDING_TCP=""; FW_PENDING_UDP=""
-      err "No se pudo proteger el motor nuevo; no se detiene el actual"
-      pause; return 1
-    fi
-    ENGINE="$prev"; FW_PENDING_TCP=""; FW_PENDING_UDP=""
-  fi
-  old_svc=$(engine_svc); ENGINE="$target"; new_svc=$(engine_svc)
-  stop_engine_svc "$old_svc"
-  systemctl enable --now "$new_svc" >/dev/null 2>&1 || systemctl start "$new_svc" >/dev/null 2>&1
-  sleep 3
-
-  # Verificación real: quedarse sin DNS deja la casa entera sin internet, así
-  # que si el motor nuevo no resuelve se vuelve al anterior sin preguntar.
-  if dns_healthy "$PIHOLE_PORT"; then
-    load_conf; ENGINE="$target"; save_conf
-    ok "Motor activo: $tgt_n"
-    configure_engine || warn "Revisa la configuración: panel → Reoptimizar"
-    if fw_active; then
-      info "Regenerando el cortafuegos con los puertos de $tgt_n"
-      install_firewall_quiet && ok "Cortafuegos al día" \
-                             || warn "Revísalo: panel → Seguridad"
-    fi
-  else
-    err "$tgt_n no resuelve en el puerto $PIHOLE_PORT; vuelvo a $cur_n"
-    stop_engine_svc "$new_svc"
-    ENGINE="$prev"
-    systemctl enable --now "$old_svc" >/dev/null 2>&1 || systemctl start "$old_svc" >/dev/null 2>&1
-    sleep 2
-    if dns_healthy "$PIHOLE_PORT"; then
-      ok "$cur_n restaurado y resolviendo"
-    else
-      err "Ninguno de los dos resuelve. Revisa: systemctl status $old_svc"
-    fi
-  fi
+  local result=0
+  dns_transaction "pihole-FTL $AGH_SVC" dns_switch_engine "$target" || result=$?
   pause
+  return "$result"
+}
+
+dns_switch_engine() {
+  local target="$1" old_svc
+  dns_prepare_engine_firewall "$target" || return 1
+  old_svc=$(engine_svc)
+  dns_touch_service "$old_svc"
+  stop_engine_svc "$old_svc" || return 1
+  ENGINE="$target"
+  dns_activate_engine || return 1
+  ok "Motor activo: $(engine_name)"
+}
+
+dns_activate_engine() {
+  # Pi-hole necesita fijar dns.port antes de que configure_engine lo reinicie.
+  dns_touch_engine
+  if [[ "$ENGINE" == pihole ]]; then ph_set dns.port "$PIHOLE_PORT" || return 1; fi
+  dns_apply_engine || return 1
+  dns_read_engine_web_port || return 1
+  systemctl enable "$(engine_svc)" || return 1
+  dns_finish_firewall && dns_save_conf
 }
 
 apply_sysctl_dns() {
@@ -1527,21 +1819,22 @@ do_install() {
   echo "    ${NUM}1${NC}) ${PH}Pi-hole${NC}       — más listas, panel clásico, gravity"
   echo "    ${NUM}2${NC}) ${AG}AdGuard Home${NC}  — DNS cifrado propio, reglas por cliente"
   echo
-  local pick def=1
+  local pick def=1 target
   [[ "$ENGINE" == adguard ]] && def=2
   pick=$(ask "Opción [1-2]:" "$def")
   case "$pick" in
-    2) ENGINE=adguard ;;
-    *) ENGINE=pihole  ;;
+    2) target=adguard ;;
+    *) target=pihole ;;
   esac
-  local ENAME; ENAME=$(engine_name)
+  local ENAME ECOLOR
+  ENAME=$(ENGINE="$target" engine_name); ECOLOR=$(ENGINE="$target" engine_color)
 
   echo
   echo "  Sistema : $OS_NAME"
   echo "  Equipo  : $MODEL · ${RAM_MB} MB · $CORES núcleos"
   echo "  Entorno : $PLATFORM"
   echo "  IP      : $LISTEN_IP"
-  echo "  Filtro  : $(engine_color)${ENAME}${NC}"
+  echo "  Filtro  : $ECOLOR${ENAME}${NC}"
   echo "  Puertos : DNS $PIHOLE_PORT · Unbound $UNBOUND_PORT · Web $WEB_PORT"
   if (( IS_VPS )); then
     echo
@@ -1552,125 +1845,11 @@ do_install() {
   echo
   yes_no "¿Continuar?" || { info "Cancelado"; pause; return; }
 
-  step "1/6 · Paquetes"
-  apt-get update -y || warn "apt-get update falló, sigo"
-  apt-get install -y unbound dnsutils curl ca-certificates ethtool \
-    || { err "No se pudieron instalar los paquetes"; pause; return 1; }
-  ok "Paquetes listos"
-
-  step "2/6 · Puerto 53"
-  if resolved_conflicts; then
-    warn "systemd-resolved está ocupando el puerto 53 (típico de Ubuntu)."
-    warn "Sin liberarlo, Pi-hole no puede arrancar."
-    if yes_no "¿Desactivo solo el stub de systemd-resolved?"; then
-      fix_resolved || { err "No se pudo liberar el 53"; pause; return 1; }
-    else
-      err "Sin el puerto 53 libre no se puede seguir"; pause; return 1
-    fi
-  else
-    ok "Puerto 53 disponible"
-  fi
-
-  step "3/6 · $ENAME"
-  if [[ "$ENGINE" == adguard ]]; then
-    detect_adguard
-    if (( AGH_PRESENT )); then
-      ok "AdGuard Home ya está instalado${AGH_VER:+ ($AGH_VER)}, no lo toco"
-    else
-      warn "Se descargará el instalador oficial, se validará como shell y se"
-      warn "mostrará su hash antes de ejecutarlo."
-      pause
-      fetch_and_run_installer \
-        "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh" \
-        "adguard" -v \
-        || { err "Falló la instalación de AdGuard Home"; pause; return 1; }
-      detect_adguard
-    fi
-    # Pi-hole y AdGuard no pueden compartir el 53.
-    if (( PH_MAJOR > 0 )) && systemctl is-active --quiet pihole-FTL 2>/dev/null; then
-      warn "Pi-hole tiene el puerto $PIHOLE_PORT: se para y se deshabilita (no se desinstala)"
-      stop_engine_svc pihole-FTL
-    fi
-  else
-    if need pihole; then
-      ok "Pi-hole ya está instalado, no lo toco"
-    else
-      warn "El instalador de Pi-hole es interactivo y pide su propia configuración."
-      warn "Se descargará primero, se validará como Bash y se mostrará su hash."
-      pause
-      local installer installer_hash
-      installer=$(mktemp) || { err "No se pudo crear un fichero temporal"; pause; return 1; }
-      if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
-           --connect-timeout 10 --max-time 120 \
-           -o "$installer" https://install.pi-hole.net; then
-        rm -f "$installer"
-        err "No se pudo descargar el instalador de Pi-hole"; pause; return 1
-      fi
-      if ! bash -n "$installer" || ! grep -qi 'pi-hole' "$installer"; then
-        rm -f "$installer"
-        err "El fichero descargado no parece un instalador válido de Pi-hole"
-        pause; return 1
-      fi
-      installer_hash=$(sha256sum "$installer" | awk '{print $1}')
-      info "SHA-256 del instalador descargado: $installer_hash"
-      if ! bash "$installer"; then
-        rm -f "$installer"
-        err "Falló la instalación de Pi-hole"; pause; return 1
-      fi
-      rm -f "$installer"
-    fi
-    detect_pihole
-    if (( AGH_PRESENT )) && systemctl is-active --quiet "$AGH_SVC" 2>/dev/null; then
-      warn "AdGuard tiene el puerto $PIHOLE_PORT: se para y se deshabilita (no se desinstala)"
-      stop_engine_svc "$AGH_SVC"
-    fi
-  fi
-
-  step "4/6 · Ajustes del kernel"
-  apply_sysctl_dns; ok "Buffers UDP ampliados"
-
-  step "5/6 · Unbound"
-  local bk; bk=$(backup_now)
-  write_unbound_conf
-  apply_unbound "$bk" || { pause; return 1; }
-
-  step "6/6 · Enlazar $ENAME con Unbound"
-  # AdGuard no puede configurarse hasta que su asistente web crea el usuario, y
-  # ese paso lo da la persona: el script no inventa credenciales.
-  if [[ "$ENGINE" == adguard ]]; then
-    detect_adguard
-    if (( ! AGH_READY )); then
-      echo
-      warn "Falta el asistente web de AdGuard, y ese paso lo das tú:"
-      warn "pide crear usuario y contraseña, y el script no las genera."
-      echo
-      echo "    1) Abre  ${BLD}http://$LISTEN_IP:3000${NC}"
-      echo "    2) Escucha DNS en ${BLD}todas${NC} las interfaces, puerto ${BLD}$PIHOLE_PORT${NC}"
-      echo "    3) Crea tu usuario y termina"
-      echo
-      info "Cuando acabes, pulsa Enter y sigo con la optimización."
-      pause
-      detect_adguard
-    fi
-  fi
-  if ! configure_engine; then
-    err "La configuración no quedó completa; restaurando la copia anterior"
-    restore_engine "$bk"
-    restore_unbound "$bk"
-    pause
-    return 1
-  fi
-  load_conf; save_conf
-  echo
-  ok "Instalación terminada"
-  if [[ "$ENGINE" == adguard ]]; then
-    echo "  Panel web : http://$LISTEN_IP:$WEB_PORT"
-  else
-    echo "  Panel web : http://$LISTEN_IP:$WEB_PORT/admin"
-  fi
-  echo "  DNS       : $LISTEN_IP:$PIHOLE_PORT → Unbound 127.0.0.1#$UNBOUND_PORT"
-  echo "  Copia     : $bk"
-  echo
+  local result=0
+  dns_transaction "unbound pihole-FTL $AGH_SVC" dns_install "$target" || result=$?
+  if (( result != 0 )); then pause; return "$result"; fi
+  load_conf
+  apply_sysctl_dns
 
   if (( IS_VPS )); then
     step "Cerrar el DNS a internet"
@@ -1678,7 +1857,9 @@ do_install() {
     warn "Y hay que cerrar el 53 al mundo antes de que lo encuentre un escáner."
     echo
     if ! fw_active; then
-      yes_no "¿Pongo el cortafuegos ahora? (recomendado)" && install_firewall
+      if yes_no "¿Pongo el cortafuegos ahora? (recomendado)"; then
+        install_firewall || return 1
+      fi
     else
       ok "El cortafuegos de nexo-dns ya está puesto"
     fi
@@ -1688,57 +1869,108 @@ do_install() {
     echo "    2) En login.tailscale.com/admin/dns pon esta máquina como"
     echo "       nameserver global y marca «Override local DNS»"
   else
-    warn "Falta lo más importante: que tus equipos lo usen. En el DHCP de tu"
-    warn "router pon $LISTEN_IP como ÚNICO servidor DNS. Si dejas uno público"
-    warn "de secundario, el filtrado se salta de forma intermitente."
+    warn "En el DHCP de tu router pon $LISTEN_IP como único DNS para los clientes."
   fi
   pause
+}
+
+dns_install() {
+  local target="$1"
+  step "1/4 · Paquetes"
+  dns_touch_service unbound
+  apt-get update -y || warn "apt-get update falló, sigo"
+  apt-get install -y unbound dnsutils curl ca-certificates ethtool \
+    || { err "No se pudieron instalar los paquetes"; return 1; }
+  ok "Paquetes listos"
+
+  step "2/4 · Unbound"
+  dns_touch_service unbound "$UNBOUND_CONF"
+  write_unbound_conf && apply_unbound || return 1
+
+  step "3/4 · Preparar el filtro"
+  dns_prepare_engine_firewall "$target" && dns_prepare_resolved || return 1
+  ENGINE="$target"
+  dns_install_filter || return 1
+
+  step "4/4 · Enlazar $(engine_name) con Unbound"
+  systemctl enable unbound && dns_activate_engine || return 1
+  ok "Instalación terminada"
+  if [[ "$ENGINE" == adguard ]]; then
+    echo "  Panel web : http://$LISTEN_IP:$WEB_PORT"
+  else
+    echo "  Panel web : http://$LISTEN_IP:$WEB_PORT/admin"
+  fi
+  echo "  DNS       : $LISTEN_IP:$PIHOLE_PORT → Unbound 127.0.0.1#$UNBOUND_PORT"
+}
+
+dns_install_filter() {
+  local other_svc=pihole-FTL
+  if [[ "$ENGINE" == pihole ]]; then other_svc="$AGH_SVC"; fi
+  if systemctl cat "$other_svc" >/dev/null 2>&1; then
+    dns_touch_service "$other_svc"
+    stop_engine_svc "$other_svc" || return 1
+  fi
+  txn_keep_new=1
+  if [[ "$ENGINE" == adguard ]]; then
+    dns_touch_engine
+    detect_adguard
+    if (( ! AGH_PRESENT )); then
+      fetch_and_run_installer \
+        "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh" \
+        adguard -v || { err "Falló la instalación de AdGuard Home"; return 1; }
+      detect_adguard
+    fi
+    (( AGH_PRESENT )) || { err "No aparece el binario de AdGuard Home"; return 1; }
+    dns_adguard_wizard
+  else
+    if ! need pihole; then
+      warn "El instalador oficial de Pi-hole es interactivo."
+      dns_touch_engine
+      fetch_and_run_installer https://install.pi-hole.net pi-hole \
+        || { err "Falló la instalación de Pi-hole"; return 1; }
+    fi
+    detect_pihole
+    (( PH_MAJOR >= 6 )) || { err "Se necesita Pi-hole v6"; return 1; }
+  fi
 }
 
 # ═══════════════════════════════════════════════════════ CAMBIO DE PUERTOS ═════
 change_unbound_port() {
   clear_screen; step "Puerto de Unbound"
-  echo "  Actual: ${BLD}$UNBOUND_PORT${NC}   ·   Pi-hole usa el $PIHOLE_PORT"
-  local np; np=$(ask "Nuevo puerto para Unbound:")
-  valid_port "$np" || { err "Puerto inválido"; pause; return; }
-  [[ "$np" == "$PIHOLE_PORT" ]] && { err "Chocaría con $(engine_name) (puerto $PIHOLE_PORT)"; pause; return; }
-  if port_taken_by_other "$np" unbound; then
-    err "El puerto $np ya lo usa otro proceso:"; ss -tulpn 2>/dev/null | grep ":$np " | sed 's/^/    /'
-    pause; return
-  fi
-  fw_prepare_port_change "$np" udp || { pause; return 1; }
-  local bk; bk=$(backup_now); info "Copia en $bk"
-  sed -i "s/^\(\s*\)port:.*/\1port: $np/" "$UNBOUND_CONF"
-  local old="$UNBOUND_PORT"; UNBOUND_PORT="$np"
-  if apply_unbound "$bk"; then
-    local ENAME; ENAME=$(engine_name)
-    if ! engine_ready; then
-      # Sin motor listo no hay nada que reapuntar, y sobre todo: no se puede
-      # condicionar el cambio a que resuelva. Antes se revertía un cambio
-      # correcto solo porque el filtro no estaba instalado.
-      save_conf; ok "Unbound movido del $old al $np"
-      warn "$ENAME no está listo: cuando lo esté, apunta su upstream a 127.0.0.1#$np"
-    else
-      # configure_engine reapunta el upstream del motor que toque y reinicia
-      # su servicio; devuelve 1 si algo falla.
-      if configure_engine >/dev/null; then
-        sleep 2
-      else
-        err "No se pudo reapuntar $ENAME; revirtiendo"
-        UNBOUND_PORT="$old"; restore_engine "$bk"; restore_unbound "$bk"
-        pause; return
-      fi
-      if dns_healthy "$PIHOLE_PORT"; then
-        save_conf; ok "Unbound movido del $old al $np y $ENAME apuntando ahí"
-      else
-        err "$ENAME dejó de resolver; revirtiendo"
-        UNBOUND_PORT="$old"; restore_engine "$bk"; restore_unbound "$bk"
-      fi
-    fi
-  else
-    UNBOUND_PORT="$old"
-  fi
+  echo "  Actual: ${BLD}$UNBOUND_PORT${NC}   ·   $(engine_name) usa el $PIHOLE_PORT"
+  local np result=0
+  np=$(ask "Nuevo puerto para Unbound:")
+  valid_port "$np" || { err "Puerto inválido"; pause; return 1; }
+  dns_transaction "unbound $(engine_svc)" dns_change_unbound "$((10#$np))" || result=$?
   pause
+  return "$result"
+}
+
+dns_change_unbound() {
+  local np="$1" src="${2:-}" old="$UNBOUND_PORT" svc
+  svc=$(engine_svc)
+  if [[ "$np" != "$old" ]]; then
+    if [[ "$np" == "$PIHOLE_PORT" || "$np" == "$WEB_PORT" ]] || port_taken_by_other "$np" unbound; then
+      err "El puerto $np ya está ocupado"
+      return 1
+    fi
+    if ! engine_ready && systemctl is-active --quiet "$svc"; then
+      err "El filtro está activo pero Nexo no puede actualizar su upstream"
+      return 1
+    fi
+    dns_prepare_firewall_port "$np" udp || return 1
+  fi
+  dns_touch_service unbound "$UNBOUND_CONF"
+  if [[ -n "$src" ]]; then
+    cp -p -- "$src" "$UNBOUND_CONF" || return 1
+  else
+    sed -i --follow-symlinks -E "s/^([[:space:]]*)port:.*/\1port: $np/" "$UNBOUND_CONF" || return 1
+  fi
+  UNBOUND_PORT="$np"
+  apply_unbound || return 1
+  if [[ "$np" != "$old" ]] && engine_ready; then dns_apply_engine || return 1; fi
+  dns_finish_firewall && dns_restore_activity "$svc" unbound && dns_save_conf || return 1
+  ok "Unbound configurado en 127.0.0.1#$np"
 }
 
 # Fija el puerto DNS en el motor activo y lo reinicia. AdGuard reescribe su
@@ -1747,8 +1979,8 @@ change_unbound_port() {
 engine_set_dns_port() {
   local p="$1"
   if [[ "$ENGINE" == adguard ]]; then
-    systemctl stop "$AGH_SVC" 2>/dev/null || true
-    agh_set dns port "$p" || return 1
+    systemctl stop "$AGH_SVC" || return 1
+    agh_set dns port "$p" && agh_validate_config || return 1
     systemctl start "$AGH_SVC" 2>/dev/null || return 1
   else
     ph_set dns.port "$p" || return 1
@@ -1759,123 +1991,107 @@ engine_set_dns_port() {
 change_pihole_port() {
   local ENAME; ENAME=$(engine_name)
   clear_screen; step "Puerto DNS de $ENAME"
-  engine_ready || { err "$ENAME no está listo"; pause; return; }
+  engine_ready || { err "$ENAME no está listo"; pause; return 1; }
   echo "  Actual: ${BLD}$PIHOLE_PORT${NC}   ·   Unbound usa el $UNBOUND_PORT"
   echo
   warn "Fuera del 53, los clientes NO lo encontrarán solos: casi ningún router"
   warn "ni sistema operativo deja indicar un puerto DNS distinto del 53."
   local np; np=$(ask "Nuevo puerto DNS para $ENAME:")
-  valid_port "$np" || { err "Puerto inválido"; pause; return; }
-  [[ "$np" == "$UNBOUND_PORT" ]] && { err "Chocaría con Unbound (puerto $UNBOUND_PORT)"; pause; return; }
+  valid_port "$np" || { err "Puerto inválido"; pause; return 1; }
+  np="$((10#$np))"
+  [[ "$np" != "$UNBOUND_PORT" && "$np" != "$WEB_PORT" ]] \
+    || { err "Chocaría con Unbound o el panel"; pause; return 1; }
   if port_taken_by_other "$np" "$(engine_svc)"; then
     err "El puerto $np ya está ocupado:"; ss -tulpn 2>/dev/null | grep ":$np " | sed 's/^/    /'
-    pause; return
+    pause; return 1
   fi
-  fw_prepare_port_change "$np" udp || { pause; return 1; }
-  local old="$PIHOLE_PORT"; backup_now >/dev/null
-  engine_set_dns_port "$np" || { err "No se pudo aplicar el cambio"; pause; return; }
-  sleep 3
-  if dns_healthy "$np"; then
-    PIHOLE_PORT="$np"; save_conf; ok "$ENAME escuchando en el $np"
-  else
-    err "No responde en el $np; volviendo al $old"
-    engine_set_dns_port "$old"
-  fi
+  local result=0
+  dns_transaction "$(engine_svc)" dns_change_filter_port "$np" || result=$?
   pause
+  return "$result"
+}
+
+dns_change_filter_port() {
+  local np="$1"
+  dns_prepare_firewall_port "$np" udp || return 1
+  dns_touch_engine
+  engine_set_dns_port "$np" || { err "No se pudo aplicar el cambio"; return 1; }
+  sleep 3
+  dns_verify_engine "$np" || return 1
+  PIHOLE_PORT="$np"
+  dns_finish_firewall && dns_restore_activity "$(engine_svc)" && dns_save_conf || return 1
+  ok "$(engine_name) configurado para el puerto $np"
 }
 
 change_web_port() {
   clear_screen; step "Puerto del panel web"
-  engine_ready || { err "$(engine_name) no está listo"; pause; return; }
-
-  # AdGuard guarda el panel como dirección completa (http.address =
-  # "0.0.0.0:3000"), no como la lista con sufijos de Pi-hole. Se resuelve aquí
-  # y se sale; el enredo de abajo es exclusivo del formato de Pi-hole.
-  if [[ "$ENGINE" == adguard ]]; then
-    local acur anp aold
-    acur=$(agh_get http address)
-    echo "  Actual: ${BLD}${acur:-$WEB_PORT}${NC}"
-    anp=$(ask "Nuevo puerto web:")
-    valid_port "$anp" || { err "Puerto inválido"; pause; return; }
-    [[ "$anp" == "$PIHOLE_PORT" || "$anp" == "$UNBOUND_PORT" ]] && {
-      err "Ese puerto ya lo usa el DNS"; pause; return; }
-    if port_taken_by_other "$anp" "$AGH_SVC"; then
-      err "El puerto $anp ya está ocupado:"; ss -tulpn 2>/dev/null | grep ":$anp " | sed 's/^/    /'
-      pause; return
-    fi
-    fw_prepare_port_change "$anp" tcp || { pause; return 1; }
-    aold="$WEB_PORT"
-    backup_now >/dev/null
-    systemctl stop "$AGH_SVC" 2>/dev/null || true
-    agh_set http address "0.0.0.0:$anp"
-    systemctl start "$AGH_SVC" 2>/dev/null || true
-    sleep 3
-    if ss -tulnH 2>/dev/null | awk -v p="$anp" '{n=split($5,a,":"); if(a[n]==p) f=1} END{exit !f}'; then
-      WEB_PORT="$anp"; save_conf; ok "Panel de AdGuard en http://$LISTEN_IP:$anp"
-    else
-      err "No escucha en el $anp; vuelvo al $aold"
-      systemctl stop "$AGH_SVC" 2>/dev/null || true
-      agh_set http address "0.0.0.0:$aold"
-      systemctl start "$AGH_SVC" 2>/dev/null || true
-    fi
-    pause; return
-  fi
-
-  local cur; cur=$(ph_get webserver.port)
-  echo "  Actual: ${BLD}${cur:-$WEB_PORT}${NC}"
+  engine_ready || { err "$(engine_name) no está listo"; pause; return 1; }
+  echo "  Actual: ${BLD}$WEB_PORT${NC}"
   local np; np=$(ask "Nuevo puerto web:")
-  valid_port "$np" || { err "Puerto inválido"; pause; return; }
+  valid_port "$np" || { err "Puerto inválido"; pause; return 1; }
+  np="$((10#$np))"
   [[ "$np" == "$PIHOLE_PORT" || "$np" == "$UNBOUND_PORT" ]] && {
-    err "Ese puerto ya lo usa el DNS"; pause; return; }
-  if port_taken_by_other "$np" pihole-FTL; then
-    err "El puerto $np ya está ocupado:"; ss -tulpn 2>/dev/null | grep ":$np " | sed 's/^/    /'
-    pause; return
+    err "Ese puerto ya lo usa el DNS"; pause; return 1; }
+  local svc result=0
+  svc=$(engine_svc)
+  if port_taken_by_other "$np" "$svc"; then
+    err "El puerto $np ya está ocupado"
+    pause; return 1
   fi
-
-  # El valor de webserver.port no es un número: es una lista con sufijos.
-  # Por defecto Pi-hole v6 trae  80o,443os,[::]:80o,[::]:443os
-  #   o = opcional (si no puede atarlo, no aborta)   s = TLS
-  # Escribir "$np,[::]:$np" a secas —como se hacía antes— borraba el 443 y
-  # dejaba el panel sin HTTPS. Aquí solo se sustituye el número del puerto
-  # HTTP y se respeta todo lo demás tal y como estuviera.
-  local new
-  new=$(awk -v old="$WEB_PORT" -v new="$np" 'BEGIN{
-      n = split(ARGV[1], parts, ",")
-      out = ""
-      for (i = 1; i <= n; i++) {
-        p = parts[i]
-        # separa un posible prefijo "[::]:" del número y sus sufijos
-        pre = ""; rest = p
-        if (sub(/^\[::\]:/, "", rest)) pre = "[::]:"
-        num = rest; sub(/[^0-9].*$/, "", num)
-        suf = substr(rest, length(num) + 1)
-        # solo se toca el puerto HTTP (sin sufijo "s"); el de TLS se respeta
-        if (num == old && suf !~ /s/) num = new
-        out = out (out == "" ? "" : ",") pre num suf
-      }
-      print out
-    }' "${cur:-$WEB_PORT}")
-  [[ -z "$new" ]] && new="$np,[::]:$np"
-
-  fw_prepare_port_change "$np" tcp || { pause; return 1; }
-  local bk; bk=$(backup_now); info "Copia en $bk"
-  echo "  ${DIM}$cur${NC}  →  ${BLD}$new${NC}"
-  ph_set webserver.port "$new" || { pause; return; }
-  systemctl restart pihole-FTL; sleep 3
-
-  # Verificación real: que algo esté escuchando de verdad en el puerto nuevo.
-  # Antes esto no se comprobaba y, si el puerto no se podía atar, te quedabas
-  # sin panel web y sin aviso.
-  if ss -tlnH 2>/dev/null | awk -v p="$np" '{n=split($4,a,":"); if(a[n]==p) f=1} END{exit !f}'; then
-    WEB_PORT="$np"; save_conf
-    ok "Panel en http://$LISTEN_IP:$np/admin"
-  else
-    err "Nadie escucha en el puerto $np; volviendo a la configuración anterior"
-    ph_set webserver.port "$cur"
-    systemctl restart pihole-FTL; sleep 2
-    warn "Panel de nuevo en el puerto $WEB_PORT"
-  fi
+  dns_transaction "$svc" dns_change_web_port "$np" || result=$?
   pause
+  return "$result"
+}
+
+dns_change_web_port() {
+  local np="$1" svc cur new suffix=""
+  svc=$(engine_svc)
+  dns_prepare_firewall_port "$np" tcp || return 1
+  dns_touch_engine
+  if [[ "$ENGINE" == adguard ]]; then
+    cur=$(agh_get http address) || return 1
+    cur=${cur//\"/}; cur=${cur//\'/}
+    if [[ "$cur" != *:* ]] || ! valid_port "${cur##*:}"; then
+      err "No se pudo leer la dirección HTTP de AdGuard"
+      return 1
+    fi
+    new="${cur%:*}:$np"
+    systemctl stop "$svc" && agh_set http address "\"$new\"" && \
+      agh_validate_config && systemctl start "$svc" || return 1
+  else
+    cur=$(ph_get webserver.port) || return 1
+    cur=${cur//\"/}
+    new=$(awk -v old="$WEB_PORT" -v new="$np" 'BEGIN {
+      n = split(ARGV[1], parts, ",")
+      for (i = 1; i <= n; i++) {
+        p = parts[i]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", p)
+        rest = p; sub(/^.*:/, "", rest)
+        pre = substr(p, 1, length(p) - length(rest))
+        if (rest ~ /^\+/) { pre = pre "+"; sub(/^\+/, "", rest) }
+        if (rest !~ /^[0-9]+[ors]*$/) exit 1
+        if (rest + 0 == old && rest !~ /s/) {
+          sub(/^[0-9]+/, new, rest); changed = 1
+        } else if (rest + 0 == new) exit 1
+        out = out (i == 1 ? "" : ",") pre rest
+      }
+      if (!changed) exit 1
+      print out
+    }' "$cur") || { err "No se pudo sustituir el puerto HTTP sin afectar a las demás escuchas"; return 1; }
+    ph_set webserver.port "$new" && systemctl restart "$svc" || return 1
+    suffix="/admin"
+  fi
+  sleep 3
+  if ! ss -tlnpH 2>/dev/null | awk -v p="$np" -v svc="$svc" '
+    { n=split($4,a,":"); if (a[n]==p && index($0, "\"" svc "\"")) found=1 }
+    END { exit !found }
+  '; then
+    err "$(engine_name) no escucha por TCP en el puerto $np"
+    return 1
+  fi
+  dns_verify_engine "$PIHOLE_PORT" || return 1
+  WEB_PORT="$np"
+  dns_finish_firewall && dns_restore_activity "$svc" && dns_save_conf || return 1
+  ok "Panel configurado en http://$LISTEN_IP:$np$suffix"
 }
 
 # ═════════════════════════════════════════════════════════ CAMBIO DE IP ════════
@@ -2127,60 +2343,128 @@ EOF
 }
 
 # ════════════════════════════════════════════════ PRECALENTADO DE CACHÉ ════════
+prewarm_agh_pairs() {
+  local top=$1 days=$2 path
+  local -a logs=()
+  for path in "$AGH_LOG.1" "$AGH_LOG"; do
+    [[ -f "$path" && -r "$path" ]] && logs+=("$path")
+  done
+  (( ${#logs[@]} )) || return 0
+  # Limitar bytes leídos incluso si hay una línea incompleta o un log gigante.
+  tail -q -c 8388608 -- "${logs[@]}" | python3 -c '
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+import json
+import re
+import sys
+
+limit, days = map(int, sys.argv[1:])
+now = datetime.now(timezone.utc)
+start = now - timedelta(days=days)
+pairs = Counter()
+for line in sys.stdin.buffer:
+    try:
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            continue
+        result = row.get("Result") or {}
+        if not isinstance(result, dict) or result.get("IsFiltered") or row.get("IsFiltered"):
+            continue
+        raw_time = row["T"].replace("Z", "+00:00")
+        raw_time = re.sub(r"\.(\d+)", lambda match: "." + match[1][:6].ljust(6, "0"), raw_time)
+        stamp = datetime.fromisoformat(raw_time)
+        name, rrtype = row["QH"], row["QT"]
+        if stamp.tzinfo is None or not start <= stamp <= now or not isinstance(name, str):
+            continue
+        if rrtype in ("A", "AAAA", "HTTPS", "SVCB") and not any(char.isspace() or char == "|" for char in name):
+            pairs[name.rstrip(".").lower(), rrtype] += 1
+    except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
+        continue
+for (name, rrtype), _ in sorted(pairs.items(), key=lambda item: (-item[1], item[0]))[:limit]:
+    print(f"{name}|{rrtype}")
+' "$top" "$days"
+}
+
+prewarm_cache() {
+  local top=${1:-100} days=${2:-7} engine port pairs name type answer status
+  local warmed=0 negative=0 failed=0 skipped=0 deadline=$((SECONDS + 90))
+  if ! [[ "$top" =~ ^[1-9][0-9]{0,2}$ && "$days" =~ ^[1-9][0-9]?$ ]] || (( top > 250 || days > 30 )); then
+    echo 'Precalentado: se espera un máximo de 1–250 pares y 1–30 días' >&2; return 2
+  fi
+  engine=$(awk -F= '$1=="ENGINE" && $2 ~ /^(pihole|adguard)$/ {engine=$2} END {print engine}' "$CONF" 2>/dev/null) || engine=""
+  if [[ -z "$engine" ]]; then
+    if systemctl is-active --quiet pihole-FTL && ! systemctl is-active --quiet "$AGH_SVC"; then engine=pihole
+    elif systemctl is-active --quiet "$AGH_SVC" && ! systemctl is-active --quiet pihole-FTL; then engine=adguard
+    else echo 'No se pudo identificar un único motor activo' >&2; return 1; fi
+  fi
+  port=$(awk '$1=="port:" {print $2; exit}' "$UNBOUND_CONF" 2>/dev/null) || port=""
+  port=${port:-5335}
+  valid_port "$port" || { echo 'Puerto de Unbound inválido' >&2; return 1; }
+  if [[ "$engine" == pihole ]]; then
+    systemctl is-active --quiet pihole-FTL || { echo 'El motor Pi-hole está inactivo' >&2; return 1; }
+    [[ -r "$FTL_DB" ]] || { echo 'Sin historial de Pi-hole'; return 0; }
+    pairs=$(pihole-FTL sqlite3 "$FTL_DB" "
+      SELECT COALESCE(d.domain, CASE WHEN typeof(q.domain)='text' THEN q.domain END) AS name,
+        CASE q.type WHEN 1 THEN 'A' WHEN 2 THEN 'AAAA' WHEN 15 THEN 'SVCB' WHEN 16 THEN 'HTTPS' END AS rrtype
+      FROM query_storage q LEFT JOIN domain_by_id d ON typeof(q.domain)='integer' AND q.domain=d.id
+      WHERE q.timestamp > strftime('%s','now','-$days days') AND q.status IN (2,3,17) AND q.type IN (1,2,15,16)
+      GROUP BY name, rrtype ORDER BY COUNT(*) DESC, name, rrtype LIMIT $top;") || return 1
+  else
+    systemctl is-active --quiet "$AGH_SVC" || { echo 'El motor AdGuard está inactivo' >&2; return 1; }
+    pairs=$(prewarm_agh_pairs "$top" "$days") || return 1
+  fi
+  [[ -n "$pairs" ]] || { echo "Sin historial utilizable de $engine"; return 0; }
+  while IFS='|' read -r name type; do
+    case "$type" in A|AAAA|HTTPS|SVCB) ;; *) continue ;; esac
+    valid_dns_name "$name" || continue
+    name=${name%.}
+    case "${name,,}" in *.local|*.lan|*.home.arpa|*.localhost|*.internal) continue ;; esac
+    if (( SECONDS >= deadline )); then skipped=$((skipped + 1)); continue; fi
+    if answer=$(dns_query 127.0.0.1 "$port" "$name" "$type"); then
+      status=$(dns_rcode <<<"$answer")
+      case "$status" in
+        NOERROR)
+          if dns_answer_has_record "$type" <<<"$answer"; then warmed=$((warmed + 1))
+          else negative=$((negative + 1)); fi ;;
+        NXDOMAIN) negative=$((negative + 1)) ;;
+        *) failed=$((failed + 1)) ;;
+      esac
+    else
+      failed=$((failed + 1))
+    fi
+    sleep 0.15
+  done <<<"$pairs"
+  printf 'precalentados: %d  negativos: %d  fallidos: %d  diferidos: %d (%s, puerto %s)\n' \
+    "$warmed" "$negative" "$failed" "$skipped" "$engine" "$port"
+  (( failed == 0 ))
+}
+
+render_prewarm_script() {
+  printf '#!/usr/bin/env bash\nset -uo pipefail\nCONF=%q\nAGH_LOG=%q\nAGH_SVC=%q\nFTL_DB=%q\nUNBOUND_CONF=%q\n' \
+    "$CONF" "$AGH_LOG" "$AGH_SVC" "$FTL_DB" "$UNBOUND_CONF"
+  declare -f valid_port valid_dns_name dns_query dns_rcode dns_answer_has_record prewarm_agh_pairs prewarm_cache
+  printf 'prewarm_cache "$@"\n'
+}
+
 install_prewarm() {
   clear_screen; step "Precalentado de caché"
   echo
-  echo "  El resolver recursivo paga un peaje la primera vez que ve un dominio:"
-  echo "  tiene que preguntar a los servidores raíz, al TLD y al autoritativo."
-  echo "  Eso son 200-500 ms. Después queda en caché y baja a 2-5 ms."
-  echo
-  echo "  Esto coge los dominios que TÚ más usas (del historial del filtro) y"
-  echo "  los resuelve cada media hora, y 3 min después de cada arranque — que"
-  echo "  es cuando la caché está vacía y más duele."
+  echo "  Prepara hasta 100 pares de dominio y tipo del historial del motor activo."
+  echo "  Consulta a Unbound cada media hora y tras el arranque, con tiempo acotado."
   echo
   engine_ready || { warn "Necesita $(engine_name) funcionando"; pause; return; }
   yes_no "¿Instalar?" || return
 
-  cat > /usr/local/bin/dns-prewarm.sh <<'SCRIPT'
-#!/usr/bin/env bash
-# Precalienta la caché de Unbound con los dominios más usados de esta red.
-# Consulta al puerto de Unbound para no ensuciar las estadísticas de Pi-hole.
-set -uo pipefail
-DB=/etc/pihole/pihole-FTL.db
-AGH_LOG=/opt/AdGuardHome/data/querylog.json
-TOP=${1:-250}; DIAS=${2:-7}
-PORT=$(grep -oP '^\s*port:\s*\K[0-9]+' /etc/unbound/unbound.conf.d/pi-hole.conf 2>/dev/null | head -1)
-PORT=${PORT:-5335}
-# Sirve para los dos motores: se mira cuál tiene historial, así el precalentado
-# sobrevive a un cambio de filtro sin reinstalarlo.
-DOMS=()
-if [[ -r "$DB" ]] && command -v pihole-FTL >/dev/null 2>&1; then
-  # status 2 = reenviada, 3 = de caché. Los bloqueados no interesa resolverlos.
-  mapfile -t DOMS < <(pihole-FTL sqlite3 "$DB" "
-    SELECT d.domain FROM query_storage q JOIN domain_by_id d ON q.domain = d.id
-    WHERE q.timestamp > strftime('%s','now','-$DIAS days') AND q.status IN (2,3)
-    GROUP BY d.domain ORDER BY COUNT(*) DESC LIMIT $TOP;" 2>/dev/null)
-fi
-if [[ ${#DOMS[@]} -eq 0 && -r "$AGH_LOG" ]]; then
-  # AdGuard: JSON por línea. QH es el dominio; se descartan las bloqueadas,
-  # que no tiene sentido resolver.
-  mapfile -t DOMS < <(tail -n 50000 "$AGH_LOG" 2>/dev/null \
-    | grep -v '"IsFiltered":true' \
-    | grep -oE '"QH":"[^"]+"' | sed 's/"QH":"//; s/"$//' \
-    | sort | uniq -c | sort -rn | head -"$TOP" | awk '{print $2}')
-fi
-[[ ${#DOMS[@]} -eq 0 ]] && { echo "Sin historial todavía"; exit 0; }
-OK=0; ERR=0
-for d in "${DOMS[@]}"; do
-  [[ -z "$d" ]] && continue
-  if dig +short +tries=1 +time=3 "$d" @127.0.0.1 -p "$PORT" >/dev/null 2>&1; then OK=$((OK+1)); else ERR=$((ERR+1)); fi
-  sleep 0.15
-done
-echo "precalentados: $OK  fallidos: $ERR  (top $TOP de $DIAS días, puerto $PORT)"
-SCRIPT
-  chmod +x /usr/local/bin/dns-prewarm.sh
+  if [[ "$ENGINE" == adguard ]] && ! need python3; then
+    err "El precalentado de AdGuard requiere python3"; pause; return 1
+  fi
+  local runner
+  runner=$(mktemp /usr/local/bin/.dns-prewarm.XXXXXX) || return 1
+  if ! (render_prewarm_script > "$runner" && bash -n "$runner" && chmod 755 "$runner" && mv -f "$runner" /usr/local/bin/dns-prewarm.sh); then
+    rm -f -- "$runner"; err "No se pudo escribir el precalentador"; pause; return 1
+  fi
 
-  cat > /etc/systemd/system/dns-prewarm.service <<'EOF'
+  cat > /etc/systemd/system/dns-prewarm.service <<'EOF' || return 1
 [Unit]
 Description=Precalienta la cache de Unbound con los dominios mas usados
 After=unbound.service pihole-FTL.service AdGuardHome.service
@@ -2188,11 +2472,12 @@ Wants=unbound.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/dns-prewarm.sh 250 7
+ExecStart=/usr/local/bin/dns-prewarm.sh 100 7
+TimeoutStartSec=2min
 Nice=15
 IOSchedulingClass=idle
 EOF
-  cat > /etc/systemd/system/dns-prewarm.timer <<'EOF'
+  cat > /etc/systemd/system/dns-prewarm.timer <<'EOF' || return 1
 [Unit]
 Description=Precalentado periodico de la cache DNS
 
@@ -2204,11 +2489,12 @@ RandomizedDelaySec=2min
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now dns-prewarm.timer >/dev/null 2>&1
+  if ! (systemctl daemon-reload && systemctl enable --now dns-prewarm.timer); then
+    err "No se pudo activar el temporizador"; pause; return 1
+  fi
   ok "Instalado y activado"
   info "Primera pasada en marcha (tarda un par de minutos)..."
-  systemctl start dns-prewarm.service &
+  systemctl start --no-block dns-prewarm.service || { err "No se pudo iniciar la primera pasada"; pause; return 1; }
   pause
 }
 
@@ -2386,29 +2672,38 @@ health_check() {
   local fails=0 d o s t
   echo "  ${BLD}Resolución${NC}"
   for d in wikipedia.org github.com amazon.es unam.mx; do
-    o=$(dig "$d" @127.0.0.1 -p "$PIHOLE_PORT" +time=5 2>/dev/null)
-    s=$(grep -oE 'status: [A-Z]+' <<<"$o" | head -1 | awk '{print $2}')
+    o=$(dns_query 127.0.0.1 "$PIHOLE_PORT" "$d" A 2>/dev/null) || o=""
+    s=$(dns_rcode <<<"$o")
     t=$(grep -oE 'Query time: [0-9]+' <<<"$o" | head -1 | awk '{print $3}')
-    if [[ "$s" == "NOERROR" ]]; then printf "    ${GRN}✓${NC} %-18s %s ms\n" "$d" "${t:-?}"
-    else printf "    ${RED}✗${NC} %-18s %s\n" "$d" "${s:-sin respuesta}"; fails=$((fails+1)); fi
+    if [[ "$s" == "NOERROR" ]] && dns_answer_has_record A 1 <<<"$o"; then
+      printf "    ${GRN}✓${NC} %-18s %s ms\n" "$d" "${t:-?}"
+    else printf "    ${RED}✗${NC} %-18s %s\n" "$d" "${s:-sin respuesta} · sin A utilizable"; fails=$((fails+1)); fi
   done
   echo; echo "  ${BLD}DNSSEC${NC}"
-  local ad; ad=$(dig +dnssec cloudflare.com @127.0.0.1 -p "$UNBOUND_PORT" +time=5 2>/dev/null | grep -c ' ad;')
-  [[ "$ad" == "1" ]] && echo "    ${GRN}✓${NC} firma válida aceptada (flag ad)" \
-                     || { echo "    ${RED}✗${NC} sin flag ad consultando a Unbound"; fails=$((fails+1)); }
-  for d in dnssec-failed.org brokendnssec.net; do
-    s=$(dig "$d" @127.0.0.1 -p "$UNBOUND_PORT" +time=5 2>/dev/null | grep -oE 'status: [A-Z]+' | head -1 | awk '{print $2}')
-    [[ "$s" == "SERVFAIL" ]] && echo "    ${GRN}✓${NC} $d rechazado" \
-                             || { echo "    ${RED}✗${NC} $d dio $s (debería ser SERVFAIL)"; fails=$((fails+1)); }
-  done
+  o=$(dns_query 127.0.0.1 "$UNBOUND_PORT" cloudflare.com A +dnssec 2>/dev/null) || o=""
+  if [[ $(dns_rcode <<<"$o") == NOERROR ]] && dns_answer_has_record A <<<"$o" \
+      && grep -qE '^;; flags:[^;]*[[:space:]]ad([[:space:]]|;)' <<<"$o"; then
+    echo "    ${GRN}✓${NC} firma válida aceptada (flag ad)"
+  else echo "    ${RED}✗${NC} falta respuesta validada de Unbound"; fails=$((fails+1)); fi
+  o=$(dns_query 127.0.0.1 "$UNBOUND_PORT" dnssec-failed.org A 2>/dev/null) || o=""
+  s=$(dns_rcode <<<"$o")
+  [[ "$s" == "SERVFAIL" ]] && echo "    ${GRN}✓${NC} dnssec-failed.org rechazado" \
+    || { echo "    ${RED}✗${NC} dnssec-failed.org dio ${s:-sin respuesta} (se esperaba SERVFAIL)"; fails=$((fails+1)); }
   echo; echo "  ${BLD}Filtrado${NC}"
   for d in doubleclick.net googleadservices.com; do
-    local ip; ip=$(dig_short "$d" @127.0.0.1 -p "$PIHOLE_PORT")
-    [[ "$ip" == "0.0.0.0" || -z "$ip" ]] && echo "    ${GRN}✓${NC} $d bloqueado" || echo "    ${YEL}!${NC} $d → $ip"
+    o=$(dns_query 127.0.0.1 "$PIHOLE_PORT" "$d" A 2>/dev/null) || o=""
+    s=$(dns_rcode <<<"$o")
+    case "$s" in
+      NOERROR)
+        if awk '$3=="IN" && $4=="A" && ($5=="0.0.0.0" || $5 ~ /^127\./) {found=1} END {exit !found}' <<<"$o"; then
+          echo "    ${GRN}✓${NC} $d bloqueado (respuesta sintética)"
+        elif dns_answer_has_record A 1 <<<"$o"; then
+          echo "    ${YEL}!${NC} $d obtuvo un registro A"
+        else echo "    ${YEL}!${NC} $d sin registro A · bloqueo sin confirmar"; fi ;;
+      NXDOMAIN|REFUSED) echo "    ${YEL}!${NC} $d → $s · bloqueo sin confirmar" ;;
+      *) echo "    ${RED}✗${NC} $d → ${s:-sin respuesta}"; fails=$((fails+1)) ;;
+    esac
   done
-  local gh; gh=$(dig_short github.com @127.0.0.1 -p "$PIHOLE_PORT")
-  [[ -n "$gh" ]] && echo "    ${GRN}✓${NC} github.com resuelve normal ($gh)" \
-                 || { echo "    ${RED}✗${NC} falso positivo: github.com no resuelve"; fails=$((fails+1)); }
 
   # ── ¿Lo está usando alguien? ──
   # El fallo más común no es la config: es que el router siga repartiendo
@@ -2476,10 +2771,118 @@ health_check() {
   echo
   (( fails == 0 )) && ok "Todo correcto" || err "$fails prueba(s) fallidas"
   pause
+  (( fails == 0 ))
+}
+
+# `dig` mide el intercambio DNS. El primer pase refleja la caché que ya
+# existe y las repeticiones permiten observar el comportamiento en caliente.
+bench_phase() {
+  local json=$1 layer=$2 server=$3 port=$4 phase=$5 rounds=$6; shift 6
+  local pair name type answer code ms rc round
+  local total=0 noerror=0 nodata=0 nxdomain=0 servfail=0 timeout=0 other=0
+  local deadline=$((SECONDS + 60)) skipped=0 p50=null p95=null p99=null
+  local -a times=()
+  for (( round=0; round<rounds; round++ )); do
+    for pair; do
+      if (( SECONDS >= deadline )); then skipped=$((skipped + 1)); continue; fi
+      name=${pair% *}; type=${pair##* }
+      total=$((total + 1))
+      if answer=$(dns_query "$server" "$port" "$name" "$type" 2>/dev/null); then
+        code=$(dns_rcode <<<"$answer")
+        case "$code" in
+          NOERROR)
+            if dns_answer_has_record "$type" <<<"$answer"; then
+              ms=$(awk '/^;; Query time: [0-9]+ msec/ {print $4; exit}' <<<"$answer")
+              if [[ "$ms" =~ ^[0-9]+$ ]]; then
+                times+=("$ms"); noerror=$((noerror + 1))
+              else other=$((other + 1)); fi
+            else nodata=$((nodata + 1)); fi ;;
+          NXDOMAIN) nxdomain=$((nxdomain + 1)) ;;
+          SERVFAIL) servfail=$((servfail + 1)) ;;
+          *) other=$((other + 1)) ;;
+        esac
+      else
+        rc=$?
+        if (( rc == 9 )); then timeout=$((timeout + 1)); else other=$((other + 1)); fi
+      fi
+      sleep 0.10
+    done
+  done
+  if (( noerror )); then
+    read -r p50 p95 p99 < <(printf '%s\n' "${times[@]}" | sort -n | awk '
+      {values[NR]=$1} END {print values[int((NR*50+99)/100)], values[int((NR*95+99)/100)], values[int((NR*99+99)/100)]}')
+  fi
+  if (( json )); then
+    printf '{"layer":"%s","server":"%s","port":%s,"phase":"%s","queries":%s,"noerror":%s,"nodata":%s,"nxdomain":%s,"servfail":%s,"timeout":%s,"other":%s,"skipped":%s,"p50_ms":%s,"p95_ms":%s,"p99_ms":%s}' \
+      "$layer" "$server" "$port" "$phase" "$total" "$noerror" "$nodata" "$nxdomain" "$servfail" "$timeout" "$other" "$skipped" "$p50" "$p95" "$p99"
+  else
+    printf '%s %s:%s · %s · %s/%s útiles · p50/p95/p99 %s/%s/%s ms\n' \
+      "$layer" "$server" "$port" "$phase" "$noerror" "$total" "${p50/null/-}" "${p95/null/-}" "${p99/null/-}"
+    printf '  NODATA/bloqueo=%s NXDOMAIN=%s SERVFAIL=%s sin respuesta=%s otros=%s omitidas=%s\n' \
+      "$nodata" "$nxdomain" "$servfail" "$timeout" "$other" "$skipped"
+  fi
+  (( noerror > 0 ))
+}
+
+bench_dns() {
+  local json=0 rounds=2 corpus="" selection=both server=127.0.0.1
+  local filter_port=$PIHOLE_PORT unbound_port=$UNBOUND_PORT
+  local name type extra layer phase port samples result failed=0
+  local -a pairs=() layers=(filter unbound) results=()
+  while (( $# )); do
+    case "$1" in
+      --json) json=1; shift; continue ;;
+      --names) corpus=${2:-} ;;
+      --layer) selection=${2:-} ;;
+      --samples) rounds=${2:-} ;;
+      --server) server=${2:-} ;;
+      --filter-port) filter_port=${2:-} ;;
+      --unbound-port) unbound_port=${2:-} ;;
+      *) err "Opción desconocida de bench: $1" >&2; return 2 ;;
+    esac
+    [[ -n "${2:-}" && "$2" != --* ]] || { err "Falta el valor de $1" >&2; return 2; }
+    shift 2
+  done
+  case "$selection" in filter|unbound) layers=("$selection") ;; both) ;; *) err "--layer espera filter, unbound o both" >&2; return 2 ;; esac
+  [[ "$rounds" =~ ^([1-9]|10)$ ]] || { err "--samples espera de 1 a 10" >&2; return 2; }
+  if ! valid_ip "$server" && ! [[ "$server" =~ ^[0-9A-Fa-f:]+$ && "$server" == *:* ]]; then
+    err "--server espera una dirección IPv4 o IPv6" >&2; return 2
+  fi
+  if ! valid_port "$filter_port" || ! valid_port "$unbound_port"; then err "Puerto de DNS inválido" >&2; return 2; fi
+  need dig || { err "bench requiere dig (paquete dnsutils)" >&2; return 1; }
+  if [[ -n "$corpus" ]]; then
+    [[ -f "$corpus" && -r "$corpus" ]] || { err "No se puede leer el corpus" >&2; return 2; }
+    while read -r name type extra || [[ -n "$name" ]]; do
+      [[ -z "$name" || "$name" == '#'* ]] && continue
+      type=${type:-A}
+      if ! valid_dns_name "$name" || ! [[ "$type" =~ ^(A|AAAA|HTTPS|SVCB)$ && -z "$extra" ]]; then
+        err "Corpus inválido. Usa un dominio y opcionalmente A, AAAA, HTTPS o SVCB por línea" >&2; return 2
+      fi
+      pairs+=("$name $type")
+      (( ${#pairs[@]} <= 50 )) || { err "El corpus admite hasta 50 pares" >&2; return 2; }
+    done < "$corpus"
+  else
+    pairs=('example.com A' 'wikipedia.org A' 'cloudflare.com AAAA' 'iana.org A')
+  fi
+  (( ${#pairs[@]} )) || { err "El corpus no contiene consultas" >&2; return 2; }
+  if (( ! json )); then info "first_pass usa la caché existente. repeat repite las mismas consultas."; fi
+  for layer in "${layers[@]}"; do
+    if [[ "$layer" == filter ]]; then port=$((10#$filter_port)); else port=$((10#$unbound_port)); fi
+    for phase in first_pass repeat; do
+      samples=1; [[ "$phase" != repeat ]] || samples=$rounds
+      result=$(bench_phase "$json" "$layer" "$server" "$port" "$phase" "$samples" "${pairs[@]}") || failed=1
+      if (( json )); then results+=("$result"); else printf '%s\n' "$result"; fi
+    done
+  done
+  if (( json )); then
+    (IFS=,; printf '{"version":"%s","cache_flushed":false,"pairs":%d,"results":[%s]}\n' \
+      "$NEXO_VERSION" "${#pairs[@]}" "${results[*]}")
+  fi
+  (( failed == 0 ))
 }
 
 do_optimize() {
-  local ENAME; ENAME=$(engine_name)
+  local ENAME result=0; ENAME=$(engine_name)
   clear_screen; step "Reoptimizar Unbound + $ENAME"
   detect_os; detect_hw; detect_engine
   ENAME=$(engine_name)
@@ -2487,48 +2890,54 @@ do_optimize() {
   echo "  → Unbound: num-threads=$THREADS · msg-cache=$MSG · rrset-cache=$RRSET"
   echo "  → Filtro : $(engine_color)${ENAME}${NC} apuntando a 127.0.0.1#$UNBOUND_PORT"
   echo
-  yes_no "¿Continuar?" || return
-  local bk; bk=$(backup_now); info "Copia en $bk"
-  apply_sysctl_dns
-  write_unbound_conf
-  if apply_unbound "$bk"; then
-    if configure_engine; then
-      save_conf; ok "Optimización aplicada"
-    else
-      err "No se pudo configurar $ENAME; restaurando la copia anterior"
-      restore_engine "$bk"
-      restore_unbound "$bk"
-    fi
+  yes_no "¿Continuar?" || return 0
+  engine_ready || { err "$ENAME no está listo"; pause; return 1; }
+  dns_transaction "unbound $(engine_svc)" dns_optimize || result=$?
+  if (( result == 0 )); then
+    apply_sysctl_dns
+    ok "Optimización aplicada"
   fi
   pause
+  return "$result"
+}
+
+dns_optimize() {
+  local svc; svc=$(engine_svc)
+  dns_touch_service unbound "$UNBOUND_CONF"
+  write_unbound_conf && apply_unbound optimize && dns_apply_engine &&
+    dns_restore_activity "$svc" unbound && dns_save_conf
 }
 
 backups_menu() {
   clear_screen; step "Copias de seguridad"
-  local list; mapfile -t list < <(ls -1t "$BACKUP_ROOT" 2>/dev/null | head -10)
-  if [[ ${#list[@]} -eq 0 ]]; then info "Todavía no hay copias"; pause; return; fi
-  local i=1 b
-  for b in "${list[@]}"; do printf '    %2d) %s\n' "$i" "$b"; i=$((i+1)); done
+  local -a list
+  mapfile -t list < <(find "$BACKUP_ROOT" -mindepth 2 -maxdepth 2 -type f -name "${UNBOUND_CONF##*/}" \
+    -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -10 | cut -d ' ' -f 2-)
+  if [[ ${#list[@]} -eq 0 ]]; then info "Todavía no hay copias de Unbound"; pause; return 0; fi
+  local i=1 path folder
+  for path in "${list[@]}"; do
+    folder=${path%/*}
+    printf '    %2d) %s\n' "$i" "${folder##*/}"; i=$((i+1))
+  done
   echo "     0) Volver"
   echo
-  local o; o=$(ask "Restaurar la config de Unbound de cuál:")
-  [[ "$o" =~ ^[0-9]+$ ]] && (( o >= 1 && o <= ${#list[@]} )) || return
-  local src="$BACKUP_ROOT/${list[$((o-1))]}/pi-hole.conf"
-  [[ -f "$src" ]] || { err "Esa copia no tiene pi-hole.conf"; pause; return; }
-  echo
-  yes_no "¿Restaurar ${list[$((o-1))]}?" || return
-  local bk; bk=$(backup_now)
-  cp -a "$src" "$UNBOUND_CONF"
-  if apply_unbound "$bk"; then
-    load_conf; save_conf; ok "Restaurado"
-  fi
+  local selected port result=0
+  selected=$(ask "Restaurar la config de Unbound de cuál:")
+  [[ "$selected" =~ ^[0-9]{1,2}$ ]] && (( 10#$selected >= 1 && 10#$selected <= ${#list[@]} )) || return 0
+  path=${list[$((10#$selected-1))]}
+  port=$(awk '$1=="port:" {print $2; exit}' "$path") || return 1
+  valid_port "$port" || { err "No se pudo determinar el puerto de la copia"; pause; return 1; }
+  folder=${path%/*}
+  yes_no "¿Restaurar ${folder##*/} y comprobar el puerto $port?" || return 0
+  dns_transaction "unbound $(engine_svc)" dns_change_unbound "$((10#$port))" "$path" || result=$?
   pause
+  return "$result"
 }
 
 # ═══════════════════════════════════════════════════════════ SEGURIDAD ═════════
 security_audit() {
   step "Auditoría de seguridad (solo lectura)"
-  local failures=0 warnings=0 value interface service
+  local failures=0 warnings=0 value service sockets
   service=$(engine_svc)
   if systemctl is-active --quiet unbound && systemctl is-active --quiet "$service"; then
     ok "Servicios DNS activos"
@@ -2536,19 +2945,32 @@ security_audit() {
   if dns_healthy "$PIHOLE_PORT" && dns_healthy "$UNBOUND_PORT"; then
     ok "Filtro y Unbound responden con registros válidos"
   else err "Resolución DNS fallida"; failures=$((failures+1)); fi
-  if need unbound-checkconf; then
-    value=$(unbound-checkconf -o interface 2>/dev/null) || value=""
-    if [[ -z "$value" ]]; then
-      warn "No se pudieron verificar las interfaces efectivas de Unbound"; warnings=$((warnings+1))
-    else
-      local exposed=0
-      for interface in $value; do
-        case "$interface" in 127.0.0.1|::1|127.0.0.1@*|::1@*) ;; *) exposed=1 ;; esac
-      done
-      if (( exposed )); then err "Unbound tiene interfaces fuera de loopback"; failures=$((failures+1))
-      else ok "Interfaces efectivas de Unbound limitadas a loopback"; fi
-    fi
-  else warn "Falta unbound-checkconf"; warnings=$((warnings+1)); fi
+  local configured automatic outside
+  configured=$(unbound-checkconf -o interface 2>/dev/null) || configured=""
+  automatic=$(unbound-checkconf -o interface-automatic 2>/dev/null) || automatic=""
+  outside=$(awk '{for(i=1;i<=NF;i++) if ($i !~ /^(127[.]0[.]0[.]1|::1)(@[0-9]+)?$/) print $i}' <<<"$configured")
+  if [[ "$automatic" == yes ]]; then
+    err "Unbound tiene interface-automatic activo (escucha UDP fuera de loopback)"
+    failures=$((failures+1))
+  elif [[ -n "$outside" ]]; then
+    err "Unbound tiene interfaces fuera de loopback: $(paste -sd, <<<"$outside")"
+    failures=$((failures+1))
+  elif [[ -z "$configured" || "$automatic" != no ]]; then
+    warn "Configuración de escucha de Unbound sin verificar"
+    warnings=$((warnings+1))
+  fi
+  sockets=$(ss -tulpnH 2>/dev/null) || sockets=""
+  sockets=$(awk '$0 ~ /"unbound",pid=/ && $1 ~ /^(tcp|udp)$/ {print $1, $5}' <<<"$sockets")
+  outside=$(awk '$2 !~ /^(127[.]0[.]0[.]1|\[::1\]|::1):[0-9]+$/ {print $1 " " $2}' <<<"$sockets")
+  if [[ -n "$outside" ]]; then
+    err "Sockets de Unbound fuera de loopback: $(paste -sd, <<<"$outside")"
+    failures=$((failures+1))
+  elif ! grep -q '^tcp ' <<<"$sockets" || ! grep -q '^udp ' <<<"$sockets"; then
+    warn "Escucha efectiva de Unbound sin verificar en TCP y UDP"
+    warnings=$((warnings+1))
+  else
+    ok "Sockets TCP y UDP de Unbound limitados a loopback"
+  fi
   if fw_active; then
     ok "Tabla de firewall propia cargada"
     if systemctl is-enabled --quiet nexo-dns-firewall.service; then ok "Carga al arrancar habilitada"
@@ -2577,6 +2999,9 @@ security_audit() {
 
 FW_NFT=/etc/nexo-dns-firewall.nft
 FW_UNIT=/etc/systemd/system/nexo-dns-firewall.service
+FW_NFTABLES_CONF=/etc/nftables.conf
+FW_NFTABLES_LOAD=/etc/nexo-dns-nftables.conf
+FW_NFTABLES_DROPIN=/etc/systemd/system/nftables.service.d/90-nexo-dns.conf
 FW_TRUST_CONF=/etc/nexo-dns-trusted.conf
 FW_PENDING_TCP=""; FW_PENDING_UDP=""
 
@@ -2621,9 +3046,9 @@ pihole_web_ports() {
   fi
   raw=${raw//,/ }
   for token in $raw; do
-    # CivetWeb acepta 80o, 443os, [::]:443s y dirección:puerto.
+    # CivetWeb acepta +80, 80o, 443os, [::]:443s y dirección:puerto.
     token=${token##*:}
-    if [[ "$token" =~ ^([0-9]+)[ors]*$ ]]; then
+    if [[ "$token" =~ ^\+?([0-9]+)[ors]*$ ]]; then
       p=${BASH_REMATCH[1]}
       valid_port "$p" || return 1
       printf '%s\n' "$p"
@@ -2658,17 +3083,31 @@ engine_fw_ports() {
   valid_port "$agh_dns" && FW_UDP="$FW_UDP, $agh_dns" && FW_TCP="$FW_TCP, $agh_dns"
   valid_port "$agh_web" && FW_TCP="$FW_TCP, $agh_web"
 
-  local tcp="" udp="" v
+  local tcp="" udp="" https dot q dc p tls_enabled http3
   (( AGH_READY )) || tcp="3000"
-  if [[ "$(agh_get tls enabled)" == "true" ]]; then
-    for v in port_https port_dns_over_tls; do
-      local p; p=$(agh_get tls "$v")
-      valid_port "$p" && tcp="${tcp:+$tcp, }$p"
+  tls_enabled=$(agh_get tls enabled) || return 1
+  http3=$(agh_get dns serve_http3) || return 1
+  if ! [[ "${tls_enabled,,}" =~ ^(true|false)?$ && "${http3,,}" =~ ^(true|false)?$ ]]; then
+    err "No se pudo verificar el estado de TLS o HTTP/3 de AdGuard"; return 1
+  fi
+  if [[ "${tls_enabled,,}" == true ]]; then
+    https=$(agh_get tls port_https)
+    dot=$(agh_get tls port_dns_over_tls)
+    q=$(agh_get tls port_dns_over_quic)
+    dc=$(agh_get tls port_dnscrypt)
+    for p in "$https" "$dot" "$q" "$dc"; do
+      [[ -z "$p" || "$p" =~ ^0+$ ]] || valid_port "$p" || {
+        err "Puerto TLS de AdGuard inválido: $p"
+        return 1
+      }
     done
-    local q; q=$(agh_get tls port_dns_over_quic)
-    [[ "$q" =~ ^[0-9]+$ ]] && (( q > 0 )) && udp="${udp:+$udp, }$q"
-    local dc; dc=$(agh_get tls port_dnscrypt)
-    if [[ "$dc" =~ ^[0-9]+$ ]] && (( dc > 0 )); then
+    if valid_port "$https"; then
+      tcp="${tcp:+$tcp, }$https"
+      [[ "${http3,,}" != true ]] || udp="$https"
+    fi
+    valid_port "$dot" && tcp="${tcp:+$tcp, }$dot"
+    valid_port "$q" && udp="${udp:+$udp, }$q"
+    if valid_port "$dc"; then
       tcp="${tcp:+$tcp, }$dc"; udp="${udp:+$udp, }$dc"
     fi
   fi
@@ -2715,10 +3154,10 @@ fw_trusted_networks() {
 }
 
 dns_healthy() {
-  # dig puede devolver código cero con SERVFAIL: exige NOERROR y una respuesta A.
+  # Un registro nulo de bloqueo no verifica que el motor resuelva.
   local answer
-  answer=$(dig +time=5 +tries=1 +noall +comments +answer "${2:-example.com}" A @127.0.0.1 -p "$1" 2>/dev/null) || return 1
-  grep -q 'status: NOERROR' <<<"$answer" && awk '$4=="A" && $5 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {ok=1} END {exit !ok}' <<<"$answer"
+  answer=$(dns_query 127.0.0.1 "$1" "${2:-example.com}" A 2>/dev/null) || return 1
+  [[ $(dns_rcode <<<"$answer") == NOERROR ]] && dns_answer_has_record A 1 <<<"$answer"
 }
 
 # La IP pública se pregunta por DNS, no por HTTP: es una consulta normal a
@@ -2812,7 +3251,7 @@ install_firewall() {
   need nft || {
     warn "Hace falta nftables."
     yes_no "¿Lo instalo?" || { pause; return; }
-    apt-get install -y nftables || { err "No se pudo instalar"; pause; return; }
+    apt-get install -y nftables || { err "No se pudo instalar"; pause; return 1; }
   }
   engine_fw_ports || { pause; return 1; }
   fw_trusted_networks || { pause; return 1; }
@@ -2833,12 +3272,108 @@ install_firewall() {
   echo "  restringir el puerto SSH habitual; no sustituye un firewall general."
   echo
   yes_no "¿Aplicar?" || { pause; return; }
-  install_firewall_quiet
+  local status
+  install_firewall_quiet || { status=$?; pause; return "$status"; }
   echo
   warn "Esto es el cortafuegos DEL SISTEMA. Si tu proveedor tiene además"
   warn "grupos de seguridad (AWS, Azure, GCP...), revísalos también: son"
   warn "una segunda puerta, por delante de esta."
   pause
+}
+
+fw_snapshot() {
+  local dir="$1" item path tables service_state
+  for item in FW_NFT FW_UNIT FW_NFTABLES_LOAD FW_NFTABLES_DROPIN; do
+    path=${!item}
+    if [[ -e "$path" || -L "$path" ]]; then
+      [[ -f "$path" && ! -L "$path" ]] &&
+        cp -a -- "$path" "$dir/$item" && cmp -s -- "$path" "$dir/$item" || return 1
+    fi
+  done
+  service_state=$(systemctl show -p ActiveState -p UnitFileState nexo-dns-firewall.service) || return 1
+  if grep -Fxq 'ActiveState=active' <<<"$service_state"; then
+    touch "$dir/active" || return 1
+  elif ! grep -Eq '^ActiveState=(inactive|failed)$' <<<"$service_state"; then
+    return 1
+  fi
+  if grep -Fxq 'UnitFileState=enabled' <<<"$service_state"; then
+    touch "$dir/enabled" || return 1
+  elif ! grep -Eq '^UnitFileState=(disabled)?$' <<<"$service_state"; then
+    return 1
+  fi
+  tables=$(nft -n list tables) || return 1
+  printf 'table inet nexo_dns\ndelete table inet nexo_dns\n' > "$dir/rollback.nft" || return 1
+  if grep -Fxq 'table inet nexo_dns' <<<"$tables"; then
+    nft -n list table inet nexo_dns >> "$dir/rollback.nft" || return 1
+  fi
+  nft -c -f "$dir/rollback.nft" || return 1
+  touch "$dir/complete"
+}
+
+fw_replace_file() {
+  local source="$1" target="$2" temp
+  temp=$(mktemp "$target.XXXXXXXX") || return 1
+  if cp -a -- "$source" "$temp" && cmp -s -- "$source" "$temp" && mv -fT -- "$temp" "$target"; then
+    return 0
+  fi
+  rm -f -- "$temp"
+  return 1
+}
+
+fw_restore_snapshot() {
+  local dir="$1" item path result=0
+  [[ -f "$dir/complete" && -s "$dir/rollback.nft" ]] || return 1
+  if [[ ! -f "$dir/active" ]]; then
+    systemctl stop nexo-dns-firewall.service >/dev/null 2>&1 ||
+      { systemctl is-active --quiet nexo-dns-firewall.service && result=1; }
+  fi
+  if [[ ! -f "$dir/enabled" ]] && systemctl is-enabled --quiet nexo-dns-firewall.service; then
+    systemctl disable nexo-dns-firewall.service >/dev/null || result=1
+  fi
+  for item in FW_NFTABLES_DROPIN FW_NFTABLES_LOAD FW_UNIT FW_NFT; do
+    path=${!item}
+    if [[ -f "$dir/$item" ]]; then
+      fw_replace_file "$dir/$item" "$path" || result=1
+    else
+      rm -f -- "$path" || result=1
+    fi
+  done
+  systemctl daemon-reload || result=1
+  if [[ -f "$dir/enabled" ]] && ! systemctl is-enabled --quiet nexo-dns-firewall.service; then
+    systemctl enable nexo-dns-firewall.service >/dev/null || result=1
+  fi
+  if [[ -f "$dir/active" ]] && ! systemctl is-active --quiet nexo-dns-firewall.service; then
+    systemctl start nexo-dns-firewall.service >/dev/null || result=1
+  fi
+  nft -f "$dir/rollback.nft" || result=1
+  if (( result )); then err "RESTAURACIÓN INCOMPLETA: respaldo en $dir"; fi
+  return "$result"
+}
+
+fw_nftables_compatible() {
+  local nftbin="$1" expected="$2" details
+  details=$(systemctl show -p ExecStart -p ExecReload -p ExecStop -p ExecStartPre \
+    -p ExecStartPost -p ExecStopPost nftables.service) || return 1
+  awk -v nft="$nftbin" -v native="$FW_NFTABLES_CONF" -v managed="$FW_NFTABLES_LOAD" \
+      -v expected="$expected" '
+    /^Exec(Start|Reload|Stop)=\{/ {
+      if (gsub(/argv\[\]=/, "&") != 1 || $0 !~ / ; ignore_errors=no ; /) bad=1
+      split($0, field, " ; ")
+      command=field[2]
+      sub(/^argv\[\]=/, "", command)
+      # Los paquetes pueden usar /sbin o /usr/sbin según usrmerge.
+      sub(/^\/sbin\/nft /, "/usr/sbin/nft ", command)
+      if ($0 ~ /^ExecStart=/) start=command
+      else if ($0 ~ /^ExecReload=/) reload=command
+      else stop=command
+    }
+    /^Exec(StartPre|StartPost|StopPost)=.+/ {bad=1}
+    END {
+      sub(/^\/sbin\/nft$/, "/usr/sbin/nft", nft)
+      if (bad || start != reload || (stop != "" && stop != nft " flush ruleset")) exit 1
+      if (start == nft " -f " managed && stop == "") exit 0
+      exit !(expected == "any" && start == nft " -f " native)
+    }' <<<"$details"
 }
 
 # La generación de reglas, sin preguntas ni pausas. La usa el menú y también el
@@ -2859,20 +3394,24 @@ install_firewall_quiet() {
   while read -r sshport; do
     case ",$FW_TCP," in *",$sshport,"*) err "Puerto $sshport compartido con SSH: corrige el conflicto antes"; return 1 ;; esac
   done < <({ printf '22\n'; sshd -T 2>/dev/null | awk '$1=="port" {print $2}'; } | sort -u)
-  dns_healthy "$PIHOLE_PORT" || { err "El DNS ya falla antes del cambio; no se modifica el firewall"; return 1; }
+  local prepare=0
+  [[ "${1:-}" != prepare ]] || prepare=1
+  (( prepare )) || dns_healthy "$PIHOLE_PORT" || { err "El DNS ya falla antes del cambio; no se modifica el firewall"; return 1; }
   install -d -m 700 "$BACKUP_ROOT" || return 1
   local bk candidate nftbin
   bk=$(mktemp -d "$BACKUP_ROOT/firewall.XXXXXXXX") || return 1
   candidate="$bk/candidate.nft"
-  [[ ! -f "$FW_NFT" ]] || cp -a "$FW_NFT" "$bk/previous.nft"
-  [[ ! -f "$FW_UNIT" ]] || cp -a "$FW_UNIT" "$bk/previous.service"
-  systemctl is-enabled --quiet nexo-dns-firewall.service 2>/dev/null && touch "$bk/enabled"
-  systemctl is-active --quiet nexo-dns-firewall.service 2>/dev/null && touch "$bk/active"
-  { printf 'table inet nexo_dns\ndelete table inet nexo_dns\n'; nft -s list table inet nexo_dns 2>/dev/null || true; } > "$bk/rollback.nft"
+  fw_snapshot "$bk" || { err "Respaldo del firewall incompleto: $bk. No se aplican cambios."; return 1; }
+  nftbin=$(command -v nft) || return 1
+  if ! fw_nftables_compatible "$nftbin" any ||
+      { [[ -f "$FW_NFTABLES_DROPIN" ]] && ! grep -Fxq '# Gestionado por Nexo DNS' "$FW_NFTABLES_DROPIN"; }; then
+    err "nftables.service tiene una configuración personalizada que no se puede integrar automáticamente"
+    return 1
+  fi
 
   # `table` antes de `delete` crea la tabla si no existe: así el delete nunca
   # falla en la primera ejecución y el fichero es idempotente.
-  cat > "$candidate" <<EOF
+  cat > "$candidate" <<EOF || return 1
 #!/usr/sbin/nft -f
 # Generado por nexo-dns.sh v$NEXO_VERSION el $(date '+%Y-%m-%d %H:%M')
 # Cierra el DNS y el panel web a internet. No toca el SSH ni nada más.
@@ -2891,22 +3430,9 @@ $( [[ -z "$FW_V6" ]] || printf '        ip6 saddr { %s } accept\n' "$FW_V6" )
     }
 }
 EOF
-  chmod 600 "$candidate"
+  chmod 600 "$candidate" || return 1
 
-  if ! nft -c -f "$candidate" 2>/dev/null; then
-    err "Las reglas no son válidas:"; nft -c -f "$candidate" 2>&1 | sed 's/^/    /'
-    return 1
-  fi
-  nft -f "$candidate" || { err "No se pudieron cargar; se conserva el estado previo"; return 1; }
-  if ! dns_healthy "$PIHOLE_PORT"; then
-    err "El DNS falló: restaurando la tabla previa"
-    nft -f "$bk/rollback.nft" || err "RESTAURACIÓN FALLIDA: usa $bk/rollback.nft desde consola"
-    return 1
-  fi
-  ok "Reglas cargadas · TCP {$FW_TCP} · UDP {$FW_UDP}"
-
-  nftbin=$(command -v nft)
-  cat > "$bk/candidate.service" <<EOF
+  cat > "$bk/candidate.service" <<EOF || return 1
 [Unit]
 Description=Cortafuegos del DNS de nexo-dns
 DefaultDependencies=no
@@ -2919,42 +3445,70 @@ Conflicts=shutdown.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=$nftbin -f $FW_NFT
-ExecStop=$nftbin delete table inet nexo_dns
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  if install -m 600 "$candidate" "$FW_NFT" && install -m 644 "$bk/candidate.service" "$FW_UNIT" \
-      && systemctl daemon-reload && systemctl enable --now nexo-dns-firewall.service \
-      && systemctl is-active --quiet nexo-dns-firewall.service && dns_healthy "$PIHOLE_PORT"; then
-    ok "DNS comprobado; servicio activo y habilitado. Respaldo: $bk"
-    return 0
-  else
-    err "Falló la persistencia o la comprobación: restaurando el estado anterior"
-    # Una primera instalación fallida no debe dejar un servicio activo huérfano.
-    if [[ ! -f "$bk/active" ]]; then
-      systemctl stop nexo-dns-firewall.service >/dev/null 2>&1 || true
-    fi
-    if [[ -f "$bk/previous.nft" ]]; then cp -a "$bk/previous.nft" "$FW_NFT"; else rm -f "$FW_NFT"; fi
-    if [[ -f "$bk/previous.service" ]]; then cp -a "$bk/previous.service" "$FW_UNIT"; else rm -f "$FW_UNIT"; fi
-    [[ -f "$bk/enabled" ]] || systemctl disable nexo-dns-firewall.service >/dev/null 2>&1 || true
-    systemctl daemon-reload
-    if [[ -f "$bk/active" ]]; then
-      systemctl start nexo-dns-firewall.service >/dev/null 2>&1 || warn "No se pudo reactivar el servicio previo"
-    fi
+  # Una sola transacción: el flush nativo y la tabla de Nexo se publican juntos.
+  # El restart no vacía las tablas entre la fase Stop y la fase Start.
+  cat > "$bk/nftables-dropin.conf" <<EOF || return 1
+# Gestionado por Nexo DNS
+[Service]
+ExecStart=
+ExecStart=$nftbin -f $FW_NFTABLES_LOAD
+ExecReload=
+ExecReload=$nftbin -f $FW_NFTABLES_LOAD
+ExecStop=
+EOF
+  printf 'include "%s"\ninclude "%s"\n' "$FW_NFTABLES_CONF" "$FW_NFT" > "$bk/nftables-load.conf" || return 1
+  printf 'include "%s"\ninclude "%s"\n' "$FW_NFTABLES_CONF" "$candidate" > "$bk/nftables-check.conf" || return 1
+  chmod 644 "$bk/candidate.service" "$bk/nftables-dropin.conf" || return 1
+  chmod 600 "$bk/nftables-load.conf" || return 1
+  if ! nft -c -f "$candidate" || ! nft -c -f "$bk/nftables-check.conf"; then
+    err "No se pudo validar la carga de nftables y Nexo DNS"
+    return 1
+  fi
+  install -d -m 755 "$(dirname -- "$FW_NFTABLES_DROPIN")" || return 1
+  nft -f "$candidate" || { err "No se pudieron cargar; se conserva el estado previo"; return 1; }
+  if (( ! prepare )) && ! dns_healthy "$PIHOLE_PORT"; then
+    err "El DNS falló: restaurando la tabla previa"
     nft -f "$bk/rollback.nft" || err "RESTAURACIÓN FALLIDA: usa $bk/rollback.nft desde consola"
     return 1
   fi
+  if fw_replace_file "$candidate" "$FW_NFT" &&
+      fw_replace_file "$bk/candidate.service" "$FW_UNIT" &&
+      fw_replace_file "$bk/nftables-load.conf" "$FW_NFTABLES_LOAD" &&
+      fw_replace_file "$bk/nftables-dropin.conf" "$FW_NFTABLES_DROPIN" &&
+      systemctl daemon-reload && fw_nftables_compatible "$nftbin" managed &&
+      systemctl enable --now nexo-dns-firewall.service &&
+      systemctl is-active --quiet nexo-dns-firewall.service &&
+      systemctl is-enabled --quiet nexo-dns-firewall.service && fw_active &&
+      { (( prepare )) || dns_healthy "$PIHOLE_PORT"; }; then
+    ok "Reglas cargadas · TCP {$FW_TCP} · UDP {$FW_UDP}"
+    if (( prepare )); then info "Puertos protegidos para la transición. Respaldo: $bk"
+    else ok "DNS comprobado; servicio activo y habilitado. Respaldo: $bk"; fi
+    return 0
+  fi
+  err "Falló la persistencia o la comprobación: restaurando el estado anterior"
+  fw_restore_snapshot "$bk"
+  return 1
 }
 
 remove_firewall() {
   clear_screen; step "Quitar el cortafuegos"
-  fw_active || [[ -f "$FW_UNIT" ]] || { info "No hay nada que quitar"; pause; return; }
+  fw_active || [[ -f "$FW_UNIT" || -f "$FW_NFTABLES_DROPIN" ]] || { info "No hay nada que quitar"; pause; return; }
   yes_no "¿Seguro? El DNS volverá a estar abierto a internet" || { pause; return; }
-  nft delete table inet nexo_dns 2>/dev/null || true
-  systemctl disable --now nexo-dns-firewall.service >/dev/null 2>&1 || true
-  rm -f "$FW_NFT" "$FW_UNIT"
-  systemctl daemon-reload
+  if [[ -f "$FW_NFTABLES_DROPIN" ]]; then
+    grep -Fxq '# Gestionado por Nexo DNS' "$FW_NFTABLES_DROPIN" || return 1
+    rm -f -- "$FW_NFTABLES_DROPIN" || return 1
+  fi
+  if [[ -f "$FW_UNIT" ]]; then
+    systemctl disable --now nexo-dns-firewall.service >/dev/null || return 1
+  fi
+  rm -f -- "$FW_UNIT" || return 1
+  systemctl daemon-reload || return 1
+  rm -f -- "$FW_NFT" "$FW_NFTABLES_LOAD" || return 1
+  if fw_active; then nft delete table inet nexo_dns || return 1; fi
   ok "Reglas retiradas"
   pause
 }
@@ -3092,7 +3646,9 @@ case "$COMMAND" in
   -v|--version) echo "nexo-dns $NEXO_VERSION"; exit 0 ;;
   -h|--help)    sed -n '2,28p' "$0"; exit 0 ;;
   banner)       load_banner_engine || exit 1; splash; exit 0 ;;
-  install|status|health|audit|optimize|security|firewall|engine|panel) ;;
+  bench)        load_conf; shift; bench_dns "$@"; exit $? ;;
+  optimize)     parse_optimize_args "${@:2}" || exit $? ;;
+  install|status|health|audit|security|firewall|engine|panel) ;;
   *) err "Orden desconocida: $COMMAND"; sed -n '2,28p' "$0"; exit 1 ;;
 esac
 

@@ -28,8 +28,8 @@ jobs:
           NO_COLOR=1 TERM=xterm NEXO_ENGINE=adguard NEXO_LOGO=mini bash nexo-dns.sh banner > /tmp/banner-adguard.txt
           grep -q "Pi-hole.*Unbound.*Tailscale" /tmp/banner-pihole.txt
           grep -q "AdGuard Home.*Unbound.*Tailscale" /tmp/banner-adguard.txt
-          grep -q "nexo-dns v4.4" /tmp/banner-adguard.txt
-          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.4"
+          grep -q "nexo-dns v4.5" /tmp/banner-adguard.txt
+          test "$(bash nexo-dns.sh --version)" = "nexo-dns 4.5"
 
   python:
     name: Python ${{ matrix.python-version }}
