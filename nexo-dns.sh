@@ -1113,9 +1113,39 @@ find_root_hints() {
   echo ""
 }
 
+# Una zona raíz sana lleva el SOA de "." y al menos un glue de los servidores
+# raíz; cualquier otra cosa (HTML de error, captura de portal) se rechaza.
+root_zone_valid() { grep -q ' IN SOA ' "$1" && grep -q 'A\.ROOT-SERVERS\.NET\.' "$1"; }
+
+# Zona raíz local (RFC 8806): Unbound sirve las delegaciones de TLD desde
+# disco en vez de preguntarlas a los servidores raíz en cada consulta fría.
+# Se descarga de Internic en cada optimización; si falla, sirve la copia
+# anterior si sigue válida, y si no hay ninguna, se recurre a la recursión
+# normal. ROOT_ZONE permite a las pruebas usar una ruta temporal.
+find_root_zone() {
+  local zone tmp
+  zone=${ROOT_ZONE:-/var/lib/unbound/root.zone}
+  mkdir -p "$(dirname "$zone")" 2>/dev/null || true
+  tmp="$zone.new"
+  if curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+     -o "$tmp" https://www.internic.net/domain/root.zone 2>/dev/null \
+     && root_zone_valid "$tmp"; then
+    mv "$tmp" "$zone"
+    chown unbound:unbound "$zone" 2>/dev/null || true
+    echo "$zone"
+    return
+  fi
+  rm -f "$tmp"
+  if [[ -s "$zone" ]] && root_zone_valid "$zone"; then
+    echo "$zone"
+    return
+  fi
+  echo ""
+}
+
 write_unbound_conf() {
   detect_hw
-  local hints hints_line referral="" min_ttl
+  local hints hints_line referral="" min_ttl zone zone_line
   if [[ -r "$UNBOUND_CONF" ]]; then
     referral=$(awk '$1=="harden-referral-path:" && $2 ~ /^(yes|no)$/ {value=$2} END {print value}' "$UNBOUND_CONF")
   fi
@@ -1127,6 +1157,19 @@ write_unbound_conf() {
   else
     hints_line='    # sin root.hints: se usan los servidores raíz que Unbound trae dentro'
     warn "No hay fichero root.hints y no se ha podido descargar; se usan los internos"
+  fi
+  zone=$(find_root_zone)
+  if [[ -n "$zone" ]]; then
+    zone_line="# Zona raíz local (RFC 8806): las delegaciones de TLD se sirven desde
+# disco en vez de preguntar a los servidores raíz en cada consulta fría.
+auth-zone:
+    name: \".\"
+    zonefile: \"$zone\"
+    for-upstream: yes"
+  else
+    zone_line='# sin zona raíz local: las delegaciones de TLD se preguntan a los
+# servidores raíz (recursión normal, un poco más lenta en frío)'
+    warn "No se pudo conseguir la zona raíz; se resuelve contra los servidores raíz"
   fi
   local anchor_line='    auto-trust-anchor-file: "/var/lib/unbound/root.key"'
   if grep -rqs 'auto-trust-anchor-file' /etc/unbound/unbound.conf.d/ \
@@ -1235,6 +1278,8 @@ server:
     ### Raíz y DNSSEC #########################################################
 $hints_line
 $anchor_line
+
+$zone_line
 
 remote-control:
     control-enable: yes

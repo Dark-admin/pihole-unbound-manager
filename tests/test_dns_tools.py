@@ -162,6 +162,66 @@ parse_optimize_args && write_unbound_conf
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('cache-min-ttl: 60', conf.read_text(encoding='utf-8'))
 
+    def test_unbound_uses_local_root_zone_when_available(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            zone = Path(folder, 'root.zone')
+            zone.write_text('. 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 2 3 4 5\n', encoding='ascii')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+find_root_zone() { printf '%s\n' "$TEST_ROOTZONE"; }
+prune_unsupported() { :; }
+parse_optimize_args && write_unbound_conf
+''', TEST_UNBOUND=str(conf), TEST_ROOTZONE=str(zone))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = conf.read_text(encoding='utf-8')
+        self.assertIn('auth-zone:', content)
+        self.assertIn('name: "."', content)
+        self.assertIn('zonefile: "%s"' % zone, content)
+        self.assertIn('for-upstream: yes', content)
+
+    def test_unbound_without_root_zone_recurses_normally(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+find_root_zone() { :; }
+prune_unsupported() { :; }
+parse_optimize_args && write_unbound_conf
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = conf.read_text(encoding='utf-8')
+            output = result.stdout + result.stderr
+        self.assertNotIn('auth-zone', content)
+        self.assertIn('sin zona raíz local', content)
+        self.assertIn('zona raíz', output)
+
+    def test_root_zone_download_is_validated_and_atomic(self):
+        with tempfile.TemporaryDirectory() as folder:
+            zone = Path(folder, 'root.zone')
+            curl_mock = r'''
+curl() { local out=; while (( $# )); do [[ $1 == -o ]] && { out=$2; shift 2; continue; }; shift; done; printf '%s' "$TEST_CURL_BODY" > "$out"; }
+find_root_zone
+'''
+            env = dict(TEST_UNBOUND=str(Path(folder, 'u.conf')), ROOT_ZONE=str(zone))
+            # Contenido basura: no se escribe nada y no se anuncia ruta.
+            result = self.shell(curl_mock, TEST_CURL_BODY='esto no es una zona', **env)
+            self.assertEqual(result.stdout.strip(), '')
+            self.assertFalse(zone.exists())
+            # Zona válida: queda en su sitio y se anuncia la ruta.
+            valid = '. 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 2 3 4 5\nA.ROOT-SERVERS.NET. 172800 IN A 198.41.0.4\n'
+            result = self.shell(curl_mock, TEST_CURL_BODY=valid, **env)
+            self.assertEqual(result.stdout.strip(), str(zone))
+            self.assertEqual(zone.read_text(encoding='ascii'), valid)
+            # Descarga fallida con copia válida previa: se conserva la anterior.
+            result = self.shell('curl() { return 1; }\nfind_root_zone\n', **env)
+            self.assertEqual(result.stdout.strip(), str(zone))
+            self.assertEqual(zone.read_text(encoding='ascii'), valid)
+
     def test_unbound_reload_retains_cache_only_with_compatible_config(self):
         with tempfile.TemporaryDirectory() as folder:
             old = Path(folder, 'old.conf')
