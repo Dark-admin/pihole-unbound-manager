@@ -214,7 +214,7 @@ find_root_zone
             self.assertFalse(zone.exists())
             # Zona válida con el formato real de Internic (campos con tabuladores):
             # queda en su sitio y se anuncia la ruta.
-            valid = '. 86400\tIN\tSOA\ta.root-servers.net. nstld.verisign-grs.com. 1 2 3 4 5\nA.ROOT-SERVERS.NET.\t172800\tIN\tA\t198.41.0.4\n'
+            valid = '. 86400\tIN\tSOA\ta.root-servers.net. nstld.verisign-grs.com. 1 2 3 4 5\n.\t518400\tIN\tNS\ta.root-servers.net.\n'
             result = self.shell(curl_mock, TEST_CURL_BODY=valid, **env)
             self.assertEqual(result.stdout.strip(), str(zone))
             self.assertEqual(zone.read_text(encoding='ascii'), valid)
