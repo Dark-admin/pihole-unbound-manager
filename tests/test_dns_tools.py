@@ -212,8 +212,9 @@ find_root_zone
             result = self.shell(curl_mock, TEST_CURL_BODY='esto no es una zona', **env)
             self.assertEqual(result.stdout.strip(), '')
             self.assertFalse(zone.exists())
-            # Zona válida: queda en su sitio y se anuncia la ruta.
-            valid = '. 86400 IN SOA a.root-servers.net. nstld.verisign-grs.com. 1 2 3 4 5\nA.ROOT-SERVERS.NET. 172800 IN A 198.41.0.4\n'
+            # Zona válida con el formato real de Internic (campos con tabuladores):
+            # queda en su sitio y se anuncia la ruta.
+            valid = '. 86400\tIN\tSOA\ta.root-servers.net. nstld.verisign-grs.com. 1 2 3 4 5\nA.ROOT-SERVERS.NET.\t172800\tIN\tA\t198.41.0.4\n'
             result = self.shell(curl_mock, TEST_CURL_BODY=valid, **env)
             self.assertEqual(result.stdout.strip(), str(zone))
             self.assertEqual(zone.read_text(encoding='ascii'), valid)

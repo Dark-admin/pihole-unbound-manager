@@ -1115,7 +1115,8 @@ find_root_hints() {
 
 # Una zona raíz sana lleva el SOA de "." y al menos un glue de los servidores
 # raíz; cualquier otra cosa (HTML de error, captura de portal) se rechaza.
-root_zone_valid() { grep -q ' IN SOA ' "$1" && grep -q 'A\.ROOT-SERVERS\.NET\.' "$1"; }
+# Ojo: Internic separa los campos con tabuladores, no con espacios.
+root_zone_valid() { grep -qE '(^|[[:space:]])IN[[:space:]]+SOA([[:space:]]|$)' "$1" && grep -q 'A\.ROOT-SERVERS\.NET\.' "$1"; }
 
 # Zona raíz local (RFC 8806): Unbound sirve las delegaciones de TLD desde
 # disco en vez de preguntarlas a los servidores raíz en cada consulta fría.
