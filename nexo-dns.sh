@@ -1065,9 +1065,11 @@ OPT_REFERRAL=""; OPT_MIN_TTL=""
 
 unbound_min_ttl() {
   local value
-  value=$(awk '$1=="cache-min-ttl:" && $2 ~ /^[0-9]+$/ && $2<=120 {value=$2+0; found=1} END {if (found) print value}' \
+  # Conserva un suelo elegido a mano, pero el default viejo (120) sube a 300.
+  value=$(awk '$1=="cache-min-ttl:" && $2 ~ /^[0-9]+$/ && $2<=300 {value=$2+0; found=1} END {if (found) print value}' \
     "$UNBOUND_CONF" 2>/dev/null) || value=""
-  printf '%s\n' "${value:-120}"
+  if [[ $value == 120 ]]; then value=300; fi
+  printf '%s\n' "${value:-300}"
 }
 
 parse_optimize_args() {
@@ -1076,12 +1078,12 @@ parse_optimize_args() {
       --referral:standard) OPT_REFERRAL=no ;;
       --referral:extra) OPT_REFERRAL=yes ;;
       --min-ttl:*)
-        if [[ "${2:-}" =~ ^[0-9]{1,3}$ ]] && (( 10#$2 <= 120 )); then
+        if [[ "${2:-}" =~ ^[0-9]{1,3}$ ]] && (( 10#$2 <= 300 )); then
           OPT_MIN_TTL=$((10#$2))
         else
-          err "--min-ttl requiere segundos entre 0 y 120" >&2; return 2
+          err "--min-ttl requiere segundos entre 0 y 300" >&2; return 2
         fi ;;
-      *) err "Uso: optimize [--referral standard|extra] [--min-ttl 0..120]" >&2; return 2 ;;
+      *) err "Uso: optimize [--referral standard|extra] [--min-ttl 0..300]" >&2; return 2 ;;
     esac
     shift 2
   done
@@ -1219,13 +1221,15 @@ server:
     infra-cache-numhosts: 10000
 
     ### TTLs ##################################################################
-    # 120 y no más: los CDN usan TTLs de 30-60 s para balancear y hacer
-    # failover. Forzarlos a una hora te deja clavado en una IP muerta.
+    # 300 s (5 min) de suelo: los CDN usan TTLs de 30-60 s para balancear y
+    # hacer failover; con 5 min la caché sigue obedeciendo a cualquier CDN real.
     cache-min-ttl: $min_ttl
     cache-max-ttl: 86400
     serve-expired: yes
     serve-expired-ttl: 3600
-    serve-expired-client-timeout: 1800
+    # Si la entrada caducó, el cliente espera como mucho 300 ms un refresco;
+    # pasado ese tiempo recibe la respuesta vieja y el refresco sigue detrás.
+    serve-expired-client-timeout: 300
     serve-expired-reply-ttl: 30
 
     ### Raíz y DNSSEC #########################################################

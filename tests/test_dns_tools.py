@@ -129,6 +129,39 @@ parse_optimize_args --referral standard --min-ttl 0 && write_unbound_conf
         self.assertIn('harden-dnssec-stripped: yes', content)
         self.assertIn('module-config: "validator iterator"', content)
 
+    def test_unbound_defaults_raise_min_ttl_and_cut_expired_wait(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+prune_unsupported() { :; }
+parse_optimize_args && write_unbound_conf
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = conf.read_text(encoding='utf-8')
+        self.assertIn('cache-min-ttl: 300', content)
+        self.assertIn('serve-expired-client-timeout: 300', content)
+
+    def test_unbound_min_ttl_upgrades_old_default_but_keeps_custom_value(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            code = r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+prune_unsupported() { :; }
+printf 'server:\n  cache-min-ttl: %s\n' "$TEST_OLD_TTL" > "$UNBOUND_CONF"
+parse_optimize_args && write_unbound_conf
+'''
+            result = self.shell(code, TEST_UNBOUND=str(conf), TEST_OLD_TTL='120')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('cache-min-ttl: 300', conf.read_text(encoding='utf-8'))
+            result = self.shell(code, TEST_UNBOUND=str(conf), TEST_OLD_TTL='60')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('cache-min-ttl: 60', conf.read_text(encoding='utf-8'))
+
     def test_unbound_reload_retains_cache_only_with_compatible_config(self):
         with tempfile.TemporaryDirectory() as folder:
             old = Path(folder, 'old.conf')
