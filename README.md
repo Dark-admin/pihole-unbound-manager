@@ -358,8 +358,9 @@ ajuste está ahí por una razón concreta:
 
 | Ajuste | Motivo |
 |---|---|
-| `cache-min-ttl: 120` | Los CDN usan TTLs de 30-60 s para balancear y hacer failover. Forzarlos a una hora te deja clavado en una IP muerta cuando el CDN mueve el tráfico. |
-| `serve-expired-ttl: 3600` + `client-timeout: 1800` | Sirve caducado solo si no consigue respuesta fresca en 1,8 s, y como mucho una hora. Sin acotar, un registro obsoleto se sirve indefinidamente. |
+| `cache-min-ttl: 300` | Los CDN usan TTLs de 30-60 s para balancear y hacer failover; con 5 min de suelo la caché aguanta las ráfagas sin dejarte clavado en una IP muerta cuando el CDN mueve el tráfico. Un `--min-ttl` explícito siempre manda. |
+| `serve-expired-ttl: 3600` + `client-timeout: 300` | Sirve caducado si no consigue respuesta fresca en 300 ms (antes 1,8 s), y como mucho una hora. Sin acotar, un registro obsoleto se sirve indefinidamente. |
+| Zona raíz local (RFC 8806) | Unbound sirve las delegaciones de TLD desde `/var/lib/unbound/root.zone` en vez de preguntarlas a los servidores raíz: un TLD inexistente pasa de ~90 ms a ~2 ms (medido en la Pi). Se descarga de Internic en cada optimización con validación y reemplazo atómico; si no hay zona válida, se recurre a la recursión normal y todo sigue funcionando. |
 | `use-caps-for-id: no` | El 0x20 encoding es anti-spoofing, pero bastantes autoritativos y CDNs no preservan mayúsculas y devuelven SERVFAIL intermitentes. Con DNSSEC validando no compensa. |
 | `module-config: "validator iterator"` | Sin `subnetcache`. ECS filtra tu subred a los servidores autoritativos —justo lo contrario de para qué montas un recursivo— y además desactiva `prefetch` y `serve-expired` para ese tráfico. |
 | `private-address` (RFC1918) | Anti DNS-rebinding: un dominio público jamás debe resolver a una IP de tu red interna. |
@@ -370,6 +371,12 @@ ajuste está ahí por una razón concreta:
 
 En el lado de Pi-hole: `dnssec = false` (ya valida Unbound, hacerlo dos veces
 gasta CPU), `domainNeeded` y `bogusPriv` activos, y `EDNS0ECS` desactivado.
+
+Sobre las consultas ANY: medido en la Pi, un `ANY` a Unbound devuelve
+`ANSWER: 3` gracias a `minimal-responses`, y además Unbound solo escucha en
+localhost (quien pregunta es el propio Pi-hole), así que no hay amplificación
+que recortar y no hace falta `deny-any`. Si algún día expusieras Unbound a la
+red, esa decisión habría que reevaluarla.
 
 ## Precalentado de caché
 

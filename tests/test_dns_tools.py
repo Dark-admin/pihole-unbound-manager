@@ -222,6 +222,35 @@ find_root_zone
             self.assertEqual(result.stdout.strip(), str(zone))
             self.assertEqual(zone.read_text(encoding='ascii'), valid)
 
+    def test_prune_removes_whole_unknown_clause_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            conf.write_text(
+                'server:\n    port: 5335\n\n'
+                'auth-zone:\n    name: "."\n    zonefile: "/tmp/root.zone"\n'
+                '    for-upstream: yes\n\n'
+                'remote-control:\n    control-enable: yes\n',
+                encoding='ascii')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND
+unbound-checkconf() {
+  if grep -q 'auth-zone' "$UNBOUND_CONF"; then
+    echo "unbound-checkconf: error: unknown keyword 'auth-zone'" >&2
+    return 1
+  fi
+  ! grep -q 'zonefile\|for-upstream' "$UNBOUND_CONF"
+}
+prune_unsupported
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            content = conf.read_text(encoding='ascii')
+        self.assertNotIn('auth-zone', content)
+        self.assertNotIn('zonefile', content)
+        self.assertNotIn('for-upstream', content)
+        self.assertIn('remote-control:', content)
+        self.assertIn('control-enable: yes', content)
+        self.assertIn('port: 5335', content)
+
     def test_unbound_reload_retains_cache_only_with_compatible_config(self):
         with tempfile.TemporaryDirectory() as folder:
             old = Path(folder, 'old.conf')

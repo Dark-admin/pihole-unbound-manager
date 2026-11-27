@@ -1311,7 +1311,18 @@ prune_unsupported() {
       sed 's/^/    /' <<<"$out"; return 1
     fi
     warn "Tu Unbound no soporta '$bad' — se elimina"
-    sed -i "/^[[:space:]]*${bad}:/d" "$UNBOUND_CONF"
+    if grep -qE "^${bad}:" "$UNBOUND_CONF"; then
+      # Cláusula entera (auth-zone, remote-control...): fuera ella y todas sus
+      # opciones indentadas; borrar solo la cabecera dejaría huérfanas que
+      # romperían la siguiente validación.
+      awk -v clause="$bad" '
+        $0 ~ "^" clause ":" {skip=1; next}
+        skip && /^[^[:space:]#]/ {skip=0}
+        !skip {print}
+      ' "$UNBOUND_CONF" > "$UNBOUND_CONF.prune" && mv "$UNBOUND_CONF.prune" "$UNBOUND_CONF"
+    else
+      sed -i "/^[[:space:]]*${bad}:/d" "$UNBOUND_CONF"
+    fi
   done
   return 0
 }
