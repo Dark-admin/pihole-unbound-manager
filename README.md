@@ -66,9 +66,20 @@ Lo primero que pregunta es cuál de los dos filtros quieres:
     2) AdGuard Home  — DNS cifrado propio, reglas por cliente
 ```
 
-> **AdGuard**: su asistente web pide crear usuario y contraseña. El script se
-> detiene ahí, te da la URL (`http://IP:3000`) y sigue con la optimización
-> cuando lo hayas terminado. Las credenciales las pones tú.
+**AdGuard:** Nexo limita el asistente inicial a `127.0.0.1:3000` antes de
+arrancar el instalador. Si usas un navegador en otro equipo, abre primero un
+túnel SSH; sustituye `usuario@servidor` por tu acceso habitual:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3000:127.0.0.1:3000 usuario@servidor
+```
+
+Abre `http://127.0.0.1:3000`, crea tus credenciales y vuelve a Nexo para
+terminar. Si el navegador cambia de puerto al guardar, confirma el paso en
+Nexo y usa después la dirección del panel que elegiste. Si cancelas, Nexo
+restaura el filtro anterior y conserva la protección para un nuevo intento.
+Si ya existe un YAML de AdGuard sin credenciales válidas, Nexo no lo
+sobrescribe: detiene esa instancia incompleta e indica qué archivo revisar.
 
 Después, para todo lo demás:
 

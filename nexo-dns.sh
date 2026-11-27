@@ -52,6 +52,8 @@ AGH_BIN=$AGH_DIR/AdGuardHome
 AGH_YAML=$AGH_DIR/AdGuardHome.yaml
 AGH_LOG=$AGH_DIR/data/querylog.json
 AGH_SVC=AdGuardHome
+AGH_SETUP_DROPIN=/etc/systemd/system/AdGuardHome.service.d/99-nexo-setup.conf
+AGH_SETUP_SVC=nexo-adguard-setup.service
 
 # ══════════════════════════════════════════════════════════ presentación ═══════
 # Paleta inspirada en ambas marcas y equilibrada para fondo oscuro:
@@ -823,6 +825,105 @@ detect_adguard() {
   return 0
 }
 
+agh_setup_unit() {
+  printf '%s\n' '# Gestionado por Nexo DNS: asistente local de AdGuard' \
+    '[Unit]' "ConditionPathExists=!$AGH_SETUP_DROPIN"
+}
+
+agh_setup_owned() {
+  [[ -f "$AGH_SETUP_DROPIN" && ! -L "$AGH_SETUP_DROPIN" ]] &&
+    cmp -s "$AGH_SETUP_DROPIN" <(agh_setup_unit)
+}
+
+agh_setup_effective() {
+  local loaded conditions
+  loaded=$(systemctl show --property=DropInPaths --value "$AGH_SVC") || return 1
+  [[ " $loaded " == *" $AGH_SETUP_DROPIN "* ]] || {
+    err "Systemd no cargó la protección de AdGuard; revisa sus drop-ins"
+    return 1
+  }
+  conditions=$(busctl --system get-property org.freedesktop.systemd1 \
+    /org/freedesktop/systemd1/unit/AdGuardHome_2eservice org.freedesktop.systemd1.Unit Conditions) || return 1
+  [[ "$conditions" == *"\"ConditionPathExists\" false true \"$AGH_SETUP_DROPIN\" "* ]] || {
+    err "Systemd no conservó la condición que impide arrancar AdGuard"
+    return 1
+  }
+  ! systemctl is-active --quiet "$AGH_SVC" || {
+    err "AdGuard ya está activo sin haber terminado la configuración"
+    return 1
+  }
+}
+
+agh_prepare_setup() {
+  local staged
+  if [[ -e "$AGH_SETUP_DROPIN" || -L "$AGH_SETUP_DROPIN" ]]; then
+    agh_setup_owned || { err "No se reemplaza el drop-in ajeno: $AGH_SETUP_DROPIN"; return 1; }
+  else
+    mkdir -p -- "${AGH_SETUP_DROPIN%/*}" || return 1
+    staged=$(mktemp "$AGH_SETUP_DROPIN.XXXXXXXX") || return 1
+    if ! agh_setup_unit > "$staged" || ! mv -nT -- "$staged" "$AGH_SETUP_DROPIN"; then
+      rm -f -- "$staged"
+      return 1
+    fi
+    rm -f -- "$staged"
+    agh_setup_owned || return 1
+  fi
+  systemctl daemon-reload || { err "No se pudo cargar la protección del asistente de AdGuard"; return 1; }
+  if systemctl cat "$AGH_SVC" >/dev/null 2>&1; then
+    agh_setup_effective || return 1
+  fi
+}
+
+agh_stop_setup() {
+  if systemctl cat "$AGH_SETUP_SVC" >/dev/null 2>&1; then
+    systemctl stop "$AGH_SETUP_SVC" || return 1
+  fi
+}
+
+agh_setup_socket_local() {
+  local pid sockets
+  pid=$(systemctl show --property=MainPID --value "$AGH_SETUP_SVC") || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  sockets=$(ss -ltnpH) || return 1
+  awk -v pid="$pid" '
+    $0 ~ ("pid=" pid "[,)]") {
+      if ($4 == "127.0.0.1:3000") found=1; else other=1
+    }
+    END { exit !(found && !other) }
+  ' <<<"$sockets"
+}
+
+dns_prepare_adguard_setup() {
+  detect_adguard
+  if (( AGH_READY )); then
+    if agh_setup_owned; then
+      txn_agh_setup=1
+      agh_stop_setup || return 1
+    fi
+    return 0
+  fi
+  txn_agh_setup=1
+  dns_touch_service "$AGH_SVC" "$AGH_YAML"
+  if systemctl cat "$AGH_SVC" >/dev/null 2>&1; then
+    systemctl stop "$AGH_SVC" || return 1
+  fi
+  agh_prepare_setup && agh_stop_setup || return 1
+  if [[ -e "$AGH_YAML" || -L "$AGH_YAML" ]]; then
+    err "AdGuard tiene un YAML sin credenciales válidas; no se sobrescribe. Revisa $AGH_YAML"
+    return 1
+  fi
+}
+
+agh_remove_setup() {
+  [[ -e "$AGH_SETUP_DROPIN" || -L "$AGH_SETUP_DROPIN" ]] || return 0
+  agh_setup_owned || { err "No se retira el drop-in ajeno: $AGH_SETUP_DROPIN"; return 1; }
+  rm -- "$AGH_SETUP_DROPIN" || return 1
+  if ! systemctl daemon-reload; then
+    agh_prepare_setup || warn "No se pudo recargar el drop-in del asistente"
+    return 1
+  fi
+}
+
 # Editor mínimo del YAML de AdGuard. No se usa `yq` a propósito: no está en
 # Debian ni en Ubuntu, y meter una dependencia nueva para tocar ocho claves no
 # compensa. El fichero es plano y de indentación fija (2 espacios por nivel),
@@ -1374,7 +1475,7 @@ configure_adguard() {
   (( AGH_PRESENT )) || { warn "AdGuard Home no está instalado"; return 1; }
   if (( ! AGH_READY )); then
     warn "AdGuard está instalado pero sin pasar el asistente web."
-    warn "Abre http://$LISTEN_IP:3000 , crea tu usuario y vuelve aquí."
+    warn "Usa «Instalar AdGuard Home» en Nexo DNS para continuar con el asistente local."
     return 1
   fi
   if ! agh_no_client_upstreams; then
@@ -1401,6 +1502,7 @@ configure_adguard() {
   local rl=0; (( IS_VPS )) && rl=20
 
   # AdGuard escribe el YAML al parar. Toda edición va después del stop.
+  if agh_setup_owned; then agh_stop_setup || return 1; fi
   systemctl stop "$AGH_SVC" || return 1
 
   local failed=0
@@ -1434,6 +1536,7 @@ configure_adguard() {
   fi
   agh_validate_config || return 1
 
+  agh_remove_setup || return 1
   systemctl start "$AGH_SVC" 2>/dev/null || {
     err "AdGuard Home no se pudo arrancar tras configurarlo"
     return 1
@@ -1467,7 +1570,7 @@ stop_engine_svc() {
 # leer del disco después de cada operación.
 dns_transaction() (
   local services="$1" action="$2"; shift 2
-  local txn_dir txn_fw=0 txn_fw_changed=0 txn_conf_changed=0 txn_keep_new=0
+  local txn_dir txn_fw=0 txn_fw_changed=0 txn_conf_changed=0 txn_keep_new=0 txn_agh_setup=0
   local txn_resolved=0 resolved_dropin=/etc/systemd/resolved.conf.d/no-stub.conf
   local resolver_conf=/etc/resolv.conf svc
   local -A txn_enabled=() txn_active=() txn_services=() txn_files=()
@@ -1524,6 +1627,9 @@ dns_restore_enable() {
 
 dns_rollback() {
   local svc path failed=0 firewall_ok=1
+  if (( txn_agh_setup )); then
+    agh_stop_setup || failed=1
+  fi
   for svc in pihole-FTL "$AGH_SVC" unbound; do
     # Stop cancela un auto-restart pendiente, aunque aún no marque active.
     if [[ -v txn_services[$svc] ]] && systemctl cat "$svc" >/dev/null 2>&1; then
@@ -1556,8 +1662,18 @@ dns_rollback() {
     failed=1; firewall_ok=0
     err "El filtro se queda detenido hasta recuperar las reglas de protección"
   fi
+  if (( txn_agh_setup )); then
+    agh_prepare_setup || failed=1
+  fi
   for svc in unbound pihole-FTL "$AGH_SVC"; do
     [[ -v txn_services[$svc] ]] || continue
+    if [[ "$svc" == "$AGH_SVC" ]] && (( txn_agh_setup )); then
+      # No se reactiva una instalación pendiente aunque conservara credenciales.
+      if systemctl cat "$svc" >/dev/null 2>&1; then
+        systemctl disable "$svc" || failed=1
+      fi
+      continue
+    fi
     dns_restore_enable "$svc" "${txn_enabled[$svc]}" || failed=1
     if (( txn_active[$svc] )) && { (( firewall_ok )) || [[ "$svc" == unbound ]]; }; then
       systemctl start "$svc" || failed=1
@@ -1689,7 +1805,7 @@ fetch_and_run_installer() {   # $1 URL · $2 palabra esperada · $3... argumento
 install_adguard() {
   clear_screen; step "Instalar AdGuard Home"
   detect_adguard; detect_pihole
-  if (( AGH_PRESENT && AGH_READY )); then
+  if (( AGH_PRESENT && AGH_READY )) && ! agh_setup_owned; then
     ok "AdGuard Home ya está instalado${AGH_VER:+ ($AGH_VER)}"
     pause; return 0
   fi
@@ -1711,6 +1827,7 @@ install_adguard() {
 }
 
 dns_install_adguard() {
+  dns_prepare_adguard_setup || return 1
   dns_prepare_engine_firewall adguard && dns_prepare_resolved || return 1
   ENGINE=adguard
   dns_install_filter || return 1
@@ -1722,12 +1839,27 @@ dns_install_adguard() {
 
 dns_adguard_wizard() {
   if (( AGH_READY )); then return 0; fi
-  systemctl start "$AGH_SVC" || return 1
+  agh_setup_owned && agh_setup_effective || { err "No está preparada la protección del asistente de AdGuard"; return 1; }
+  [[ ! -e "$AGH_YAML" && ! -L "$AGH_YAML" ]] || return 1
+  systemd-run --unit="$AGH_SETUP_SVC" --collect --property=Type=exec \
+    --property=RuntimeMaxSec=30min \
+    --working-directory="$AGH_DIR" "$AGH_BIN" -w "$AGH_DIR" -c "$AGH_YAML" \
+    --web-addr 127.0.0.1:3000 || return 1
+  local attempt
+  for (( attempt=0; attempt<5; attempt++ )); do
+    agh_setup_socket_local && break
+    sleep 1
+  done
+  (( attempt < 5 )) || { err "No se verificó la escucha local del asistente"; return 1; }
   step "Asistente web de AdGuard"
-  echo "    1) Abre http://$LISTEN_IP:3000"
+  echo "    1) En el servidor, abre http://127.0.0.1:3000"
+  echo "       Desde tu PC, abre primero este túnel (ajusta usuario y servidor):"
+  echo "       ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3000:127.0.0.1:3000 usuario@$LISTEN_IP"
+  echo "       Después abre http://127.0.0.1:3000 en el navegador de tu PC."
   echo "    2) Escoge la escucha DNS y el puerto $PIHOLE_PORT"
   echo "    3) Escoge el puerto web $WEB_PORT y crea tu usuario"
   yes_no "¿Terminaste el asistente y creaste el usuario?" || return 1
+  agh_stop_setup || return 1
   detect_adguard
   if (( ! AGH_READY )); then
     err "AdGuard aún no tiene un usuario con credenciales válidas"
@@ -1888,6 +2020,7 @@ dns_install() {
   write_unbound_conf && apply_unbound || return 1
 
   step "3/4 · Preparar el filtro"
+  if [[ "$target" == adguard ]]; then dns_prepare_adguard_setup || return 1; fi
   dns_prepare_engine_firewall "$target" && dns_prepare_resolved || return 1
   ENGINE="$target"
   dns_install_filter || return 1
@@ -1913,8 +2046,10 @@ dns_install_filter() {
   txn_keep_new=1
   if [[ "$ENGINE" == adguard ]]; then
     dns_touch_engine
-    detect_adguard
     if (( ! AGH_PRESENT )); then
+      # El instalador registra e intenta iniciar la unidad. La condición la
+      # mantiene inactiva mientras existe el drop-in, incluso tras reiniciar.
+      agh_setup_owned || return 1
       fetch_and_run_installer \
         "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh" \
         adguard -v || { err "Falló la instalación de AdGuard Home"; return 1; }

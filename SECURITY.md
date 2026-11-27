@@ -22,6 +22,11 @@ de `/etc/pihole` en el informe.
 
 ## Despliegue seguro del panel
 
+El asistente inicial de AdGuard Home que arranca Nexo escucha en loopback.
+Para completarlo a distancia, usa el túnel SSH descrito en el README. Esta
+restricción es para el asistente; las reglas de acceso al panel configurado
+siguen dependiendo de su dirección de escucha y del firewall.
+
 El panel web debe permanecer en `127.0.0.1` siempre que sea posible. Para
 acceso remoto, usa Tailscale o un proxy HTTPS. Basic Auth autentica, pero no
 cifra el tráfico por sí sola.
