@@ -247,6 +247,45 @@ dns_transaction "pihole-FTL $AGH_SVC" dns_install_adguard
         self.assertEqual(self.state("AdGuardHome"), (False, False))
         self.assertIn("address: 127.0.0.1:80", (self.path / "AdGuardHome.yaml").read_text())
 
+    def test_setup_socket_check_allows_other_ports_but_requires_loopback_web(self):
+        result = self.shell(r'''
+ss() {
+  printf '%s\n' \
+    'LISTEN 0 128 127.0.0.1:3000 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=3))' \
+    'LISTEN 0 128 0.0.0.0:53 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=4))'
+}
+touch "$TEST_DIR/nexo-adguard-setup.service.exists"
+agh_setup_socket_local
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_setup_socket_check_rejects_exposed_web_port(self):
+        result = self.shell(r'''
+ss() {
+  printf '%s\n' \
+    'LISTEN 0 128 0.0.0.0:3000 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=3))' \
+    'LISTEN 0 128 127.0.0.1:3000 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=4))'
+}
+touch "$TEST_DIR/nexo-adguard-setup.service.exists"
+! agh_setup_socket_local
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_rollback_of_ready_adguard_restores_previous_service_state(self):
+        result = self.shell(r'''
+backup_now() { mkdir "$TEST_DIR/snapshot" && cp -p "$AGH_YAML" "$TEST_DIR/snapshot/AdGuardHome.yaml" && printf '%s\n' "$TEST_DIR/snapshot"; }
+agh_prepare_setup || exit 1
+systemctl enable --now "$AGH_SVC"
+failing_op() {
+  dns_prepare_adguard_setup || return 1
+  dns_touch_service "$AGH_SVC" "$AGH_YAML"
+  return 1
+}
+dns_transaction "pihole-FTL $AGH_SVC" failing_op
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.state("AdGuardHome"), (True, True))
+
     def test_configured_adguard_removes_its_setup_override(self):
         result = self.shell(r'''
 agh_prepare_setup || exit 1

@@ -885,11 +885,17 @@ agh_setup_socket_local() {
   pid=$(systemctl show --property=MainPID --value "$AGH_SETUP_SVC") || return 1
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   sockets=$(ss -ltnpH) || return 1
+  # Solo el puerto web importa: el asistente puede abrir otros sockets (p. ej.
+  # el 53), pero el 3000 debe quedar exclusivamente en loopback.
   awk -v pid="$pid" '
     $0 ~ ("pid=" pid "[,)]") {
-      if ($4 == "127.0.0.1:3000") found=1; else other=1
+      n=split($4, a, ":")
+      if (a[n] == "3000") {
+        web=1
+        if ($4 != "127.0.0.1:3000") exposed=1
+      }
     }
-    END { exit !(found && !other) }
+    END { exit !(web && !exposed) }
   ' <<<"$sockets"
 }
 
@@ -903,6 +909,7 @@ dns_prepare_adguard_setup() {
     return 0
   fi
   txn_agh_setup=1
+  txn_agh_fresh=1
   dns_touch_service "$AGH_SVC" "$AGH_YAML"
   if systemctl cat "$AGH_SVC" >/dev/null 2>&1; then
     systemctl stop "$AGH_SVC" || return 1
@@ -1570,7 +1577,7 @@ stop_engine_svc() {
 # leer del disco después de cada operación.
 dns_transaction() (
   local services="$1" action="$2"; shift 2
-  local txn_dir txn_fw=0 txn_fw_changed=0 txn_conf_changed=0 txn_keep_new=0 txn_agh_setup=0
+  local txn_dir txn_fw=0 txn_fw_changed=0 txn_conf_changed=0 txn_keep_new=0 txn_agh_setup=0 txn_agh_fresh=0
   local txn_resolved=0 resolved_dropin=/etc/systemd/resolved.conf.d/no-stub.conf
   local resolver_conf=/etc/resolv.conf svc
   local -A txn_enabled=() txn_active=() txn_services=() txn_files=()
@@ -1667,7 +1674,7 @@ dns_rollback() {
   fi
   for svc in unbound pihole-FTL "$AGH_SVC"; do
     [[ -v txn_services[$svc] ]] || continue
-    if [[ "$svc" == "$AGH_SVC" ]] && (( txn_agh_setup )); then
+    if [[ "$svc" == "$AGH_SVC" ]] && (( txn_agh_fresh )); then
       # No se reactiva una instalación pendiente aunque conservara credenciales.
       if systemctl cat "$svc" >/dev/null 2>&1; then
         systemctl disable "$svc" || failed=1
@@ -1840,17 +1847,20 @@ dns_install_adguard() {
 dns_adguard_wizard() {
   if (( AGH_READY )); then return 0; fi
   agh_setup_owned && agh_setup_effective || { err "No está preparada la protección del asistente de AdGuard"; return 1; }
-  [[ ! -e "$AGH_YAML" && ! -L "$AGH_YAML" ]] || return 1
+  if [[ -e "$AGH_YAML" || -L "$AGH_YAML" ]]; then
+    err "El asistente necesita partir sin $AGH_YAML; no se sobrescribe"
+    return 1
+  fi
   systemd-run --unit="$AGH_SETUP_SVC" --collect --property=Type=exec \
     --property=RuntimeMaxSec=30min \
     --working-directory="$AGH_DIR" "$AGH_BIN" -w "$AGH_DIR" -c "$AGH_YAML" \
     --web-addr 127.0.0.1:3000 || return 1
   local attempt
-  for (( attempt=0; attempt<5; attempt++ )); do
+  for (( attempt=0; attempt<10; attempt++ )); do
     agh_setup_socket_local && break
     sleep 1
   done
-  (( attempt < 5 )) || { err "No se verificó la escucha local del asistente"; return 1; }
+  (( attempt < 10 )) || { err "No se verificó la escucha local del asistente"; return 1; }
   step "Asistente web de AdGuard"
   echo "    1) En el servidor, abre http://127.0.0.1:3000"
   echo "       Desde tu PC, abre primero este túnel (ajusta usuario y servidor):"
@@ -1858,6 +1868,7 @@ dns_adguard_wizard() {
   echo "       Después abre http://127.0.0.1:3000 en el navegador de tu PC."
   echo "    2) Escoge la escucha DNS y el puerto $PIHOLE_PORT"
   echo "    3) Escoge el puerto web $WEB_PORT y crea tu usuario"
+  echo "    Por seguridad el asistente se detiene solo a los 30 minutos."
   yes_no "¿Terminaste el asistente y creaste el usuario?" || return 1
   agh_stop_setup || return 1
   detect_adguard
