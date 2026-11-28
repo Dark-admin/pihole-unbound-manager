@@ -384,6 +384,15 @@ retardo aleatorio. Separa respuestas utilizables, negativas y fallidas. AdGuard
 requiere `python3` para leer el historial. Ejecuta de nuevo la opción **9** al
 actualizar un precalentador de 4.4.
 
+## Estado de la zona raíz local
+
+`status` y `health` consultan a Unbound sin modificar sus datos y muestran si
+la zona raíz local está cargada (con su serial), pendiente, caducada o no
+configurada. Si el socket de control no está accesible, no está disponible el
+comando o la respuesta no se reconoce, aparece «no se pudo comprobar».
+El estado de la zona no sustituye las pruebas de resolución y DNSSEC de
+`health` ni cambia por sí solo su código de salida.
+
 ## Medir latencia DNS
 
 ```bash
