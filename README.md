@@ -358,9 +358,9 @@ ajuste está ahí por una razón concreta:
 
 | Ajuste | Motivo |
 |---|---|
-| `cache-min-ttl: 300` | Mantiene respuestas breves más tiempo en caché, a cambio de tardar más en ver cambios de IP en sitios que publican TTL bajos. Usa `--min-ttl 0` para respetar el TTL corto; si la configuración guardada tiene `120`, se trata como el valor anterior por defecto. |
+| `cache-min-ttl: 300` | Valor de Unbound cuando no hay uno guardado. Mantiene respuestas breves en caché durante más tiempo, a cambio de tardar más en ver cambios de IP. Se conserva el valor anterior, incluido `120`. Para cambiarlo, usa `optimize --min-ttl 300`; elige `0` para respetar TTL bajos. AdGuard conserva su límite anterior de 120 s. |
 | `serve-expired-ttl: 3600` + `serve-expired-client-timeout: 300` | Si hay un registro caducado utilizable, Unbound espera hasta 300 ms por el refresco (antes 1,8 s) antes de devolverlo. No es un límite para consultas sin caché. |
-| Zona raíz local (RFC 8806) | Unbound consulta la copia local durante la recursión, no entrega delegaciones a los clientes. Nexo DNS carga una copia inicial de InterNIC y Unbound la mantiene actualizada desde los servidores de transferencia de ICANN. Si la zona falla o caduca, vuelve a consultar la raíz pública, sin reenviadores DNS. |
+| Zona raíz local (RFC 8806) | Unbound obtiene y refresca la zona por AXFR y la mantiene en memoria, sin que el instalador descargue ni sobrescriba archivos. Mientras no esté disponible, o si caduca, vuelve a consultar la raíz pública. No entrega delegaciones directamente a los clientes ni usa reenviadores DNS. |
 | `use-caps-for-id: no` | El 0x20 encoding es anti-spoofing, pero bastantes autoritativos y CDNs no preservan mayúsculas y devuelven SERVFAIL intermitentes. Con DNSSEC validando no compensa. |
 | `module-config: "validator iterator"` | Sin `subnetcache`. ECS filtra tu subred a los servidores autoritativos —justo lo contrario de para qué montas un recursivo— y además desactiva `prefetch` y `serve-expired` para ese tráfico. |
 | `private-address` (RFC1918) | Anti DNS-rebinding: un dominio público jamás debe resolver a una IP de tu red interna. |

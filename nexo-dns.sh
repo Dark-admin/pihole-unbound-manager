@@ -1064,12 +1064,10 @@ detect_hw() {
 OPT_REFERRAL=""; OPT_MIN_TTL=""
 
 unbound_min_ttl() {
-  local value
-  # Conserva un suelo elegido a mano, pero el default viejo (120) sube a 300.
-  value=$(awk '$1=="cache-min-ttl:" && $2 ~ /^[0-9]+$/ && $2<=300 {value=$2+0; found=1} END {if (found) print value}' \
+  local value max=${1:-300}
+  value=$(awk -v max="$max" '$1=="cache-min-ttl:" && $2 ~ /^[0-9]+$/ && $2<=max {value=$2+0; found=1} END {if (found) print value}' \
     "$UNBOUND_CONF" 2>/dev/null) || value=""
-  if [[ $value == 120 ]]; then value=300; fi
-  printf '%s\n' "${value:-300}"
+  printf '%s\n' "${value:-$max}"
 }
 
 parse_optimize_args() {
@@ -1113,39 +1111,9 @@ find_root_hints() {
   echo ""
 }
 
-# Comprobación mínima de estructura; Unbound valida DNSSEC al resolver.
-root_zone_valid() {
-  awk 'tolower($1)=="." && tolower($3)=="in" {
-    if (tolower($4)=="soa") soa=1
-    if (tolower($4)=="ns" && tolower($5) ~ /^[a-m]\.root-servers\.net\.$/) ns=1
-  } END {exit !(soa && ns)}' "$1"
-}
-
-# Zona raíz local (RFC 8806): Unbound sirve las delegaciones de TLD desde
-# disco en vez de preguntarlas a los servidores raíz en cada consulta fría.
-# Se descarga de Internic en cada optimización; si falla, sirve la copia
-# anterior si sigue válida, y si no hay ninguna, se recurre a la recursión
-# normal. ROOT_ZONE permite a las pruebas usar una ruta temporal.
-find_root_zone() {
-  local zone tmp
-  zone=${ROOT_ZONE:-/var/lib/unbound/root.zone}
-  if mkdir -p -- "$(dirname "$zone")" 2>/dev/null && tmp=$(mktemp "$zone.XXXXXX"); then
-    if curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
-       -o "$tmp" https://www.internic.net/domain/root.zone 2>/dev/null \
-       && root_zone_valid "$tmp" && chmod 644 "$tmp" && mv -fT -- "$tmp" "$zone"; then
-      printf '%s\n' "$zone"
-      return
-    fi
-    rm -f -- "$tmp"
-  fi
-  if [[ -s "$zone" ]] && root_zone_valid "$zone"; then
-    printf '%s\n' "$zone"
-  fi
-}
-
 write_unbound_conf() {
   detect_hw
-  local hints hints_line referral="" min_ttl zone zone_line
+  local hints hints_line referral="" min_ttl
   if [[ -r "$UNBOUND_CONF" ]]; then
     referral=$(awk '$1=="harden-referral-path:" && $2 ~ /^(yes|no)$/ {value=$2} END {print value}' "$UNBOUND_CONF")
   fi
@@ -1157,23 +1125,6 @@ write_unbound_conf() {
   else
     hints_line='    # sin root.hints: se usan los servidores raíz que Unbound trae dentro'
     warn "No hay fichero root.hints y no se ha podido descargar; se usan los internos"
-  fi
-  zone=$(find_root_zone)
-  if [[ -n "$zone" ]]; then
-    zone_line="# Zona raíz local (RFC 8806): las delegaciones de TLD se sirven desde
-# disco en vez de preguntar a los servidores raíz en cada consulta fría.
-auth-zone:
-    name: \".\"
-    zonefile: \"$zone\"
-    master: 192.0.47.132
-    master: 192.0.32.132
-    for-downstream: no
-    for-upstream: yes
-    fallback-enabled: yes"
-  else
-    zone_line='# sin zona raíz local: las delegaciones de TLD se preguntan a los
-# servidores raíz (recursión normal, un poco más lenta en frío)'
-    warn "No se pudo conseguir la zona raíz; se resuelve contra los servidores raíz"
   fi
   local anchor_line='    auto-trust-anchor-file: "/var/lib/unbound/root.key"'
   if grep -rqs 'auto-trust-anchor-file' /etc/unbound/unbound.conf.d/ \
@@ -1283,7 +1234,15 @@ server:
 $hints_line
 $anchor_line
 
-$zone_line
+# Zona raíz local (RFC 8806), en memoria. Unbound la obtiene y refresca
+# por AXFR; hasta que esté disponible usa la recursión normal.
+auth-zone:
+    name: "."
+    master: 192.0.47.132
+    master: 192.0.32.132
+    for-downstream: no
+    for-upstream: yes
+    fallback-enabled: yes
 
 remote-control:
     control-enable: yes
@@ -1315,6 +1274,11 @@ prune_unsupported() {
       sed 's/^/    /' <<<"$out"; return 1
     fi
     warn "Tu Unbound no soporta '$bad' — se elimina"
+    case "$bad" in
+      master|for-upstream|for-downstream|fallback-enabled)
+        # No dejar habilitada una zona raíz con un comportamiento parcial.
+        if grep -q '^auth-zone:' "$UNBOUND_CONF"; then bad=auth-zone; fi ;;
+    esac
     if grep -qE "^${bad}:" "$UNBOUND_CONF"; then
       # Cláusula entera (auth-zone, remote-control...): fuera ella y todas sus
       # opciones indentadas; borrar solo la cabecera dejaría huérfanas que
@@ -1477,8 +1441,9 @@ configure_adguard() {
   agh_put dns fallback_dns  "  fallback_dns: []"  || failed=1
   agh_set dns enable_dnssec false     || failed=1   # ya valida Unbound
   agh_set dns cache_size "$cache"     || failed=1
-  local min_ttl; min_ttl=$(unbound_min_ttl)
-  agh_set dns cache_ttl_min "$min_ttl" || failed=1   # mismo suelo que Unbound
+  # El suelo nuevo de Unbound no cambia el margen histórico de AdGuard.
+  local min_ttl; min_ttl=$(unbound_min_ttl 120)
+  agh_set dns cache_ttl_min "$min_ttl" || failed=1
   agh_set dns cache_ttl_max 86400     || failed=1
   agh_set dns cache_optimistic true   || failed=1   # equivale a serve-expired
   agh_set dns refuse_any true         || failed=1   # ANY amplifica x54
