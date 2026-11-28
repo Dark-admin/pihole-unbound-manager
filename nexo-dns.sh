@@ -2638,6 +2638,34 @@ manage_lists() {
 }
 
 # ══════════════════════════════════════════════════════════════ ESTADO ═════════
+show_root_zone_status() {
+  local zones status='no se pudo comprobar'
+  if need unbound-control && need timeout && zones=$(timeout 2 unbound-control list_auth_zones 2>/dev/null); then
+    # El control puede listar también RPZ u otras zonas. Solo interesa «.».
+    status=$(LC_ALL=C awk '
+      NF == 0 {next}
+      $1 !~ /\.$/ {bad=1; next}
+      {
+        if ($2 == "serial" && $3 ~ /^[0-9]+$/) {
+          value="cargada · serial " $3
+          if ($4 == "since" && $5 ~ /^[0-9]+$/ && length($6) == 19 &&
+              $6 ~ /^[0-9]+-[0-9]+-[0-9]+T[0-9]+:[0-9]+:[0-9]+$/)
+            value=value " · desde " $6
+        } else if ($2 == "no" && $3 == "serial") value="pendiente de carga"
+        else if ($2 == "expired") value="caducada"
+        else {bad=1; next}
+        if ($1 == ".") root=value
+      }
+      END {
+        if (bad) print "no se pudo comprobar"
+        else if (root != "") print root
+        else print "no configurada"
+      }
+    ' <<<"$zones") || status='no se pudo comprobar'
+  fi
+  printf '    Zona raíz local: %s\n' "$status"
+}
+
 show_status() {
   clear_screen; step "Estado"
   detect_os; detect_hw; detect_platform
@@ -2673,6 +2701,7 @@ show_status() {
   echo "    ${UB}Unbound${NC} :$UNBOUND_PORT → ${r2:-${RED}sin respuesta${NC}}"
   echo "    ${EC}${EN}${NC} :$PIHOLE_PORT → ${r1:-${RED}sin respuesta${NC}}"
   echo "    ${PHD}Bloqueo${NC}       → ${bl:-(vacío)}"
+  show_root_zone_status
   if need unbound-control; then
     local st q h
     st=$(unbound-control stats_noreset 2>/dev/null)
@@ -2718,6 +2747,7 @@ health_check() {
   s=$(dns_rcode <<<"$o")
   [[ "$s" == "SERVFAIL" ]] && echo "    ${GRN}✓${NC} dnssec-failed.org rechazado" \
     || { echo "    ${RED}✗${NC} dnssec-failed.org dio ${s:-sin respuesta} (se esperaba SERVFAIL)"; fails=$((fails+1)); }
+  show_root_zone_status
   echo; echo "  ${BLD}Filtrado${NC}"
   for d in doubleclick.net googleadservices.com; do
     o=$(dns_query 127.0.0.1 "$PIHOLE_PORT" "$d" A 2>/dev/null) || o=""

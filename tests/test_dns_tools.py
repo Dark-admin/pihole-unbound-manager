@@ -46,6 +46,74 @@ health_check
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertNotIn('✓ doubleclick.net bloqueado', result.stdout)
 
+    def test_root_zone_indicator_reports_only_observed_state(self):
+        fixtures = (
+            ('rpz.test.\tserial 22\n.\tserial 2026112701\t since 1795825083 2026-11-27T18:18:03', 0, 'cargada · serial 2026112701 · desde 2026-11-27T18:18:03'),
+            ('.\tserial 0', 0, 'cargada · serial 0'),
+            ('.\tno serial', 0, 'pendiente de carga'),
+            ('.\texpired', 0, 'caducada'),
+            ('rpz.test.\tserial 22', 0, 'no configurada'),
+            ('', 0, 'no configurada'),
+            ('error unknown command', 0, 'no se pudo comprobar'),
+            ('.\tserial NaN', 0, 'no se pudo comprobar'),
+            ('.\tserial 22', 124, 'no se pudo comprobar'),
+            ('', 1, 'no se pudo comprobar'),
+        )
+        for output, rc, expected in fixtures:
+            with self.subTest(output=output, rc=rc):
+                result = self.shell(r'''
+need() { :; }
+timeout() {
+    [[ $* == '2 unbound-control list_auth_zones' ]] || return 127
+    printf '%s\n' "$TEST_ZONES"
+    return "$TEST_RC"
+}
+show_root_zone_status
+''', TEST_ZONES=output, TEST_RC=str(rc))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), 'Zona raíz local: ' + expected)
+
+    def test_root_zone_indicator_does_not_affect_health_result(self):
+        result = self.shell(r'''
+clear_screen() { :; }
+pause() { :; }
+need() { :; }
+timeout() { return 1; }
+FTL_DB=/nonexistent; AGH_LOG=/nonexistent; ENGINE=pihole; IS_VPS=0
+dns_query() {
+  case "$3" in
+    dnssec-failed.org) printf ';; ->>HEADER<<- status: SERVFAIL\n'; return ;;
+    doubleclick.net|googleadservices.com) ip=0.0.0.0 ;;
+    *) ip=192.0.2.1 ;;
+  esac
+  printf ';; ->>HEADER<<- status: NOERROR\n;; flags: qr rd ra ad;\n%s. 60 IN A %s\n' "$3" "$ip"
+}
+health_check
+''')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn('Zona raíz local: no se pudo comprobar', result.stdout)
+        self.assertIn('Todo correcto', result.stdout)
+
+    def test_status_includes_root_zone_indicator(self):
+        result = self.shell(r'''
+clear_screen() { :; }
+pause() { :; }
+detect_os() { OS_NAME=fixture; }
+detect_hw() { MODEL=fixture; RAM_MB=900; CORES=4; }
+detect_platform() { PLATFORM=fixture; IS_VPS=0; }
+systemctl() { return 1; }
+dig_short() { :; }
+free() { :; }
+cpu_temp() { :; }
+need() { [[ $1 != tailscale ]]; }
+unbound-control() { :; }
+timeout() { printf '.\tno serial\n'; }
+ENGINE=pihole; PH_MAJOR=6; LISTEN_IP=127.0.0.1; AGH_SVC=AdGuardHome
+show_status
+''')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn('Zona raíz local: pendiente de carga', result.stdout)
+
     def test_prewarm_selects_active_engine_and_checks_dns_rcode(self):
         with tempfile.TemporaryDirectory() as folder:
             conf = Path(folder, 'nexo.conf')
