@@ -1172,10 +1172,10 @@ detect_hw() {
 OPT_REFERRAL=""; OPT_MIN_TTL=""
 
 unbound_min_ttl() {
-  local value
-  value=$(awk '$1=="cache-min-ttl:" && $2 ~ /^[0-9]+$/ && $2<=120 {value=$2+0; found=1} END {if (found) print value}' \
+  local value max=${1:-300}
+  value=$(awk -v max="$max" '$1=="cache-min-ttl:" && $2 ~ /^[0-9]+$/ && $2<=max {value=$2+0; found=1} END {if (found) print value}' \
     "$UNBOUND_CONF" 2>/dev/null) || value=""
-  printf '%s\n' "${value:-120}"
+  printf '%s\n' "${value:-$max}"
 }
 
 parse_optimize_args() {
@@ -1184,12 +1184,12 @@ parse_optimize_args() {
       --referral:standard) OPT_REFERRAL=no ;;
       --referral:extra) OPT_REFERRAL=yes ;;
       --min-ttl:*)
-        if [[ "${2:-}" =~ ^[0-9]{1,3}$ ]] && (( 10#$2 <= 120 )); then
+        if [[ "${2:-}" =~ ^[0-9]{1,3}$ ]] && (( 10#$2 <= 300 )); then
           OPT_MIN_TTL=$((10#$2))
         else
-          err "--min-ttl requiere segundos entre 0 y 120" >&2; return 2
+          err "--min-ttl requiere segundos entre 0 y 300" >&2; return 2
         fi ;;
-      *) err "Uso: optimize [--referral standard|extra] [--min-ttl 0..120]" >&2; return 2 ;;
+      *) err "Uso: optimize [--referral standard|extra] [--min-ttl 0..300]" >&2; return 2 ;;
     esac
     shift 2
   done
@@ -1327,18 +1327,30 @@ server:
     infra-cache-numhosts: 10000
 
     ### TTLs ##################################################################
-    # 120 y no más: los CDN usan TTLs de 30-60 s para balancear y hacer
-    # failover. Forzarlos a una hora te deja clavado en una IP muerta.
+    # El suelo de 300 s favorece la caché, pero puede retrasar cambios de IP
+    # en sitios con TTL bajo. Usa --min-ttl 0 si prefieres respetar ese TTL.
     cache-min-ttl: $min_ttl
     cache-max-ttl: 86400
     serve-expired: yes
     serve-expired-ttl: 3600
-    serve-expired-client-timeout: 1800
+    # Si la entrada caducó, el cliente espera como mucho 300 ms un refresco;
+    # pasado ese tiempo recibe la respuesta vieja y el refresco sigue detrás.
+    serve-expired-client-timeout: 300
     serve-expired-reply-ttl: 30
 
     ### Raíz y DNSSEC #########################################################
 $hints_line
 $anchor_line
+
+# Zona raíz local (RFC 8806), en memoria. Unbound la obtiene y refresca
+# por AXFR; hasta que esté disponible usa la recursión normal.
+auth-zone:
+    name: "."
+    master: 192.0.47.132
+    master: 192.0.32.132
+    for-downstream: no
+    for-upstream: yes
+    fallback-enabled: yes
 
 remote-control:
     control-enable: yes
@@ -1370,7 +1382,23 @@ prune_unsupported() {
       sed 's/^/    /' <<<"$out"; return 1
     fi
     warn "Tu Unbound no soporta '$bad' — se elimina"
-    sed -i "/^[[:space:]]*${bad}:/d" "$UNBOUND_CONF"
+    case "$bad" in
+      master|for-upstream|for-downstream|fallback-enabled)
+        # No dejar habilitada una zona raíz con un comportamiento parcial.
+        if grep -q '^auth-zone:' "$UNBOUND_CONF"; then bad=auth-zone; fi ;;
+    esac
+    if grep -qE "^${bad}:" "$UNBOUND_CONF"; then
+      # Cláusula entera (auth-zone, remote-control...): fuera ella y todas sus
+      # opciones indentadas; borrar solo la cabecera dejaría huérfanas que
+      # romperían la siguiente validación.
+      awk -v clause="$bad" '
+        $0 ~ "^" clause ":" {skip=1; next}
+        skip && /^[^[:space:]#]/ {skip=0}
+        !skip {print}
+      ' "$UNBOUND_CONF" > "$UNBOUND_CONF.prune" && mv "$UNBOUND_CONF.prune" "$UNBOUND_CONF"
+    else
+      sed -i "/^[[:space:]]*${bad}:/d" "$UNBOUND_CONF"
+    fi
   done
   return 0
 }
@@ -1522,8 +1550,9 @@ configure_adguard() {
   agh_put dns fallback_dns  "  fallback_dns: []"  || failed=1
   agh_set dns enable_dnssec false     || failed=1   # ya valida Unbound
   agh_set dns cache_size "$cache"     || failed=1
-  local min_ttl; min_ttl=$(unbound_min_ttl)
-  agh_set dns cache_ttl_min "$min_ttl" || failed=1   # mismo suelo que Unbound
+  # El suelo nuevo de Unbound no cambia el margen histórico de AdGuard.
+  local min_ttl; min_ttl=$(unbound_min_ttl 120)
+  agh_set dns cache_ttl_min "$min_ttl" || failed=1
   agh_set dns cache_ttl_max 86400     || failed=1
   agh_set dns cache_optimistic true   || failed=1   # equivale a serve-expired
   agh_set dns refuse_any true         || failed=1   # ANY amplifica x54
@@ -2760,6 +2789,34 @@ manage_lists() {
 }
 
 # ══════════════════════════════════════════════════════════════ ESTADO ═════════
+show_root_zone_status() {
+  local zones status='no se pudo comprobar'
+  if need unbound-control && need timeout && zones=$(timeout 2 unbound-control list_auth_zones 2>/dev/null); then
+    # El control puede listar también RPZ u otras zonas. Solo interesa «.».
+    status=$(LC_ALL=C awk '
+      NF == 0 {next}
+      $1 !~ /\.$/ {bad=1; next}
+      {
+        if ($2 == "serial" && $3 ~ /^[0-9]+$/) {
+          value="cargada · serial " $3
+          if ($4 == "since" && $5 ~ /^[0-9]+$/ && length($6) == 19 &&
+              $6 ~ /^[0-9]+-[0-9]+-[0-9]+T[0-9]+:[0-9]+:[0-9]+$/)
+            value=value " · desde " $6
+        } else if ($2 == "no" && $3 == "serial") value="pendiente de carga"
+        else if ($2 == "expired") value="caducada"
+        else {bad=1; next}
+        if ($1 == ".") root=value
+      }
+      END {
+        if (bad) print "no se pudo comprobar"
+        else if (root != "") print root
+        else print "no configurada"
+      }
+    ' <<<"$zones") || status='no se pudo comprobar'
+  fi
+  printf '    Zona raíz local: %s\n' "$status"
+}
+
 show_status() {
   clear_screen; step "Estado"
   detect_os; detect_hw; detect_platform
@@ -2795,6 +2852,7 @@ show_status() {
   echo "    ${UB}Unbound${NC} :$UNBOUND_PORT → ${r2:-${RED}sin respuesta${NC}}"
   echo "    ${EC}${EN}${NC} :$PIHOLE_PORT → ${r1:-${RED}sin respuesta${NC}}"
   echo "    ${PHD}Bloqueo${NC}       → ${bl:-(vacío)}"
+  show_root_zone_status
   if need unbound-control; then
     local st q h
     st=$(unbound-control stats_noreset 2>/dev/null)
@@ -2840,6 +2898,7 @@ health_check() {
   s=$(dns_rcode <<<"$o")
   [[ "$s" == "SERVFAIL" ]] && echo "    ${GRN}✓${NC} dnssec-failed.org rechazado" \
     || { echo "    ${RED}✗${NC} dnssec-failed.org dio ${s:-sin respuesta} (se esperaba SERVFAIL)"; fails=$((fails+1)); }
+  show_root_zone_status
   echo; echo "  ${BLD}Filtrado${NC}"
   for d in doubleclick.net googleadservices.com; do
     o=$(dns_query 127.0.0.1 "$PIHOLE_PORT" "$d" A 2>/dev/null) || o=""

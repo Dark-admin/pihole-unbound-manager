@@ -46,6 +46,74 @@ health_check
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertNotIn('✓ doubleclick.net bloqueado', result.stdout)
 
+    def test_root_zone_indicator_reports_only_observed_state(self):
+        fixtures = (
+            ('rpz.test.\tserial 22\n.\tserial 2026112701\t since 1795825083 2026-11-27T18:18:03', 0, 'cargada · serial 2026112701 · desde 2026-11-27T18:18:03'),
+            ('.\tserial 0', 0, 'cargada · serial 0'),
+            ('.\tno serial', 0, 'pendiente de carga'),
+            ('.\texpired', 0, 'caducada'),
+            ('rpz.test.\tserial 22', 0, 'no configurada'),
+            ('', 0, 'no configurada'),
+            ('error unknown command', 0, 'no se pudo comprobar'),
+            ('.\tserial NaN', 0, 'no se pudo comprobar'),
+            ('.\tserial 22', 124, 'no se pudo comprobar'),
+            ('', 1, 'no se pudo comprobar'),
+        )
+        for output, rc, expected in fixtures:
+            with self.subTest(output=output, rc=rc):
+                result = self.shell(r'''
+need() { :; }
+timeout() {
+    [[ $* == '2 unbound-control list_auth_zones' ]] || return 127
+    printf '%s\n' "$TEST_ZONES"
+    return "$TEST_RC"
+}
+show_root_zone_status
+''', TEST_ZONES=output, TEST_RC=str(rc))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), 'Zona raíz local: ' + expected)
+
+    def test_root_zone_indicator_does_not_affect_health_result(self):
+        result = self.shell(r'''
+clear_screen() { :; }
+pause() { :; }
+need() { :; }
+timeout() { return 1; }
+FTL_DB=/nonexistent; AGH_LOG=/nonexistent; ENGINE=pihole; IS_VPS=0
+dns_query() {
+  case "$3" in
+    dnssec-failed.org) printf ';; ->>HEADER<<- status: SERVFAIL\n'; return ;;
+    doubleclick.net|googleadservices.com) ip=0.0.0.0 ;;
+    *) ip=192.0.2.1 ;;
+  esac
+  printf ';; ->>HEADER<<- status: NOERROR\n;; flags: qr rd ra ad;\n%s. 60 IN A %s\n' "$3" "$ip"
+}
+health_check
+''')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn('Zona raíz local: no se pudo comprobar', result.stdout)
+        self.assertIn('Todo correcto', result.stdout)
+
+    def test_status_includes_root_zone_indicator(self):
+        result = self.shell(r'''
+clear_screen() { :; }
+pause() { :; }
+detect_os() { OS_NAME=fixture; }
+detect_hw() { MODEL=fixture; RAM_MB=900; CORES=4; }
+detect_platform() { PLATFORM=fixture; IS_VPS=0; }
+systemctl() { return 1; }
+dig_short() { :; }
+free() { :; }
+cpu_temp() { :; }
+need() { [[ $1 != tailscale ]]; }
+unbound-control() { :; }
+timeout() { printf '.\tno serial\n'; }
+ENGINE=pihole; PH_MAJOR=6; LISTEN_IP=127.0.0.1; AGH_SVC=AdGuardHome
+show_status
+''')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn('Zona raíz local: pendiente de carga', result.stdout)
+
     def test_prewarm_selects_active_engine_and_checks_dns_rcode(self):
         with tempfile.TemporaryDirectory() as folder:
             conf = Path(folder, 'nexo.conf')
@@ -128,6 +196,138 @@ parse_optimize_args --referral standard --min-ttl 0 && write_unbound_conf
         self.assertIn('cache-min-ttl: 0', content)
         self.assertIn('harden-dnssec-stripped: yes', content)
         self.assertIn('module-config: "validator iterator"', content)
+
+    def test_unbound_defaults_raise_min_ttl_and_cut_expired_wait(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+prune_unsupported() { :; }
+parse_optimize_args && write_unbound_conf
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = conf.read_text(encoding='utf-8')
+        self.assertIn('cache-min-ttl: 300', content)
+        self.assertIn('serve-expired-client-timeout: 300', content)
+
+    def test_unbound_min_ttl_preserves_persisted_user_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            code = r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+prune_unsupported() { :; }
+printf 'server:\n  cache-min-ttl: %s\n' "$TEST_OLD_TTL" > "$UNBOUND_CONF"
+parse_optimize_args && write_unbound_conf
+'''
+            result = self.shell(code, TEST_UNBOUND=str(conf), TEST_OLD_TTL='120')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('cache-min-ttl: 120', conf.read_text(encoding='utf-8'))
+            result = self.shell(code, TEST_UNBOUND=str(conf), TEST_OLD_TTL='60')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('cache-min-ttl: 60', conf.read_text(encoding='utf-8'))
+
+    def test_unbound_bootstraps_root_zone_without_installer_download(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            zone = Path(folder, 'root.zone')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+curl() { printf 'unexpected root-zone download\n' >&2; return 1; }
+prune_unsupported() { :; }
+parse_optimize_args && write_unbound_conf
+''', TEST_UNBOUND=str(conf), ROOT_ZONE=str(zone))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('unexpected root-zone download', result.stderr)
+            self.assertFalse(zone.exists())
+            content = conf.read_text(encoding='utf-8')
+        self.assertIn('auth-zone:', content)
+        self.assertIn('name: "."', content)
+        self.assertIn('master: 192.0.47.132', content)
+        self.assertIn('master: 192.0.32.132', content)
+        self.assertIn('for-upstream: yes', content)
+        self.assertIn('for-downstream: no', content)
+        self.assertIn('fallback-enabled: yes', content)
+        self.assertNotIn('zonefile:', content)
+
+    def test_adguard_keeps_legacy_cache_ttl_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            code = r'''
+UNBOUND_CONF=$TEST_UNBOUND; IS_VPS=0
+detect_adguard() { AGH_PRESENT=1; AGH_READY=1; }
+detect_hw() { RAM_MB=900; }
+agh_no_client_upstreams() { :; }
+systemctl() { :; }
+agh_set_list() { :; }
+agh_put() { :; }
+agh_validate_config() { :; }
+sleep() { :; }
+agh_set() { if [[ $2 == cache_ttl_min ]]; then printf 'ttl=%s\n' "$3"; fi; }
+printf 'server:\n  cache-min-ttl: %s\n' "$TEST_OLD_TTL" > "$UNBOUND_CONF"
+configure_adguard
+'''
+            for current, expected in ((300, 120), (120, 120), (60, 60), (0, 0)):
+                with self.subTest(current=current):
+                    result = self.shell(code, TEST_UNBOUND=str(conf), TEST_OLD_TTL=str(current))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('ttl=%s' % expected, result.stdout.splitlines())
+
+    def test_prune_removes_whole_unknown_clause_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            conf.write_text(
+                'server:\n    port: 5335\n\n'
+                'auth-zone:\n    name: "."\n    zonefile: "/tmp/root.zone"\n'
+                '    for-upstream: yes\n\n'
+                'remote-control:\n    control-enable: yes\n',
+                encoding='ascii')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND
+unbound-checkconf() {
+  if grep -q 'auth-zone' "$UNBOUND_CONF"; then
+    echo "unbound-checkconf: error: unknown keyword 'auth-zone'" >&2
+    return 1
+  fi
+  ! grep -q 'zonefile\|for-upstream' "$UNBOUND_CONF"
+}
+prune_unsupported
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            content = conf.read_text(encoding='ascii')
+        self.assertNotIn('auth-zone', content)
+        self.assertNotIn('zonefile', content)
+        self.assertNotIn('for-upstream', content)
+        self.assertIn('remote-control:', content)
+        self.assertIn('control-enable: yes', content)
+        self.assertIn('port: 5335', content)
+
+    def test_prune_never_leaves_root_zone_without_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            conf.write_text(
+                'server:\n    port: 5335\nauth-zone:\n    name: "."\n'
+                '    for-upstream: yes\n    fallback-enabled: yes\n'
+                'remote-control:\n    control-enable: yes\n', encoding='ascii')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND
+unbound-checkconf() {
+  if grep -q 'fallback-enabled:' "$UNBOUND_CONF"; then
+    echo "unknown keyword 'fallback-enabled'" >&2
+    return 1
+  fi
+}
+prune_unsupported
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            content = conf.read_text(encoding='ascii')
+        self.assertNotIn('auth-zone:', content)
+        self.assertIn('remote-control:', content)
 
     def test_unbound_reload_retains_cache_only_with_compatible_config(self):
         with tempfile.TemporaryDirectory() as folder:

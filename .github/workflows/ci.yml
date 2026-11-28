@@ -38,8 +38,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Python 3.8 no tiene compilación en los runners de Ubuntu 26.04.
           - python-version: "3.8"
-            # setup-python no publica CPython 3.8 para Ubuntu 26.04.
             os: ubuntu-24.04
           - python-version: "3.12"
             os: ubuntu-latest
