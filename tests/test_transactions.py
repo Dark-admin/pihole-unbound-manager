@@ -16,6 +16,7 @@ PIHOLE_TOML="$TEST_DIR/pihole.toml"
 AGH_YAML="$TEST_DIR/AdGuardHome.yaml"
 AGH_BIN=/bin/true
 AGH_DIR="$TEST_DIR"
+AGH_SETUP_DROPIN="$TEST_DIR/AdGuardHome.service.d/99-nexo-setup.conf"
 BACKUP_ROOT="$TEST_DIR/backups"
 FW_NFT="$TEST_DIR/firewall.nft"
 FW_UNIT="$TEST_DIR/firewall.service"
@@ -77,6 +78,16 @@ systemctl() {
   local verb="$1" service="${@: -1}" p="$TEST_DIR/${@: -1}"
   shift
   case "$verb" in
+    daemon-reload) [[ ! -f "$TEST_DIR/fail-reload" ]] ;;
+    show)
+      case "$*" in
+        '--property=DropInPaths --value AdGuardHome')
+          if [[ -f "$AGH_SETUP_DROPIN" && ! -f "$TEST_DIR/missing-loaded-guard" ]]; then
+            printf '%s\n' "$AGH_SETUP_DROPIN"
+          fi ;;
+        '--property=MainPID --value nexo-adguard-setup.service') printf '12345\n' ;;
+        *) return 1 ;;
+      esac ;;
     cat) [[ -f "$p.exists" ]] ;;
     is-active) [[ -f "$p.active" ]] ;;
     is-enabled)
@@ -88,12 +99,24 @@ systemctl() {
     restart) systemctl stop "$service" && systemctl start "$service" ;;
     start)
       [[ -f "$p.exists" ]] || return 1
+      if [[ "$service" == AdGuardHome && -f "$AGH_SETUP_DROPIN" ]]; then return 0; fi
       if [[ "$service" == AdGuardHome ]] && grep -q '^  port: 5354$' "$AGH_YAML"; then return 1; fi
       printf 'start:%s\n' "$service" >> "$TEST_DIR/events"
       touch "$p.active" ;;
     *) return 1 ;;
   esac
 }
+systemd-run() {
+  [[ "$*" == *'--web-addr 127.0.0.1:3000' && ! -f "$TEST_DIR/AdGuardHome.active" ]] || return 1
+  [[ -f "$AGH_SETUP_DROPIN" ]] || return 1
+  touch "$TEST_DIR/nexo-adguard-setup.service.exists" "$TEST_DIR/nexo-adguard-setup.service.active"
+}
+busctl() {
+  [[ "$*" == *' org.freedesktop.systemd1.Unit Conditions' ]] || return 1
+  if [[ -f "$TEST_DIR/reset-guard-condition" ]]; then printf 'a(sbbsi) 0\n'; return; fi
+  printf 'a(sbbsi) 1 "ConditionPathExists" false true "%s" 0\n' "$AGH_SETUP_DROPIN"
+}
+ss() { printf '%s\n' 'LISTEN 0 128 127.0.0.1:3000 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=3))'; }
 '''
 
 
@@ -139,14 +162,141 @@ change_pihole_port
 
     def test_cancelled_adguard_wizard_brings_back_pihole(self):
         result = self.shell(r'''
+backup_now() { mkdir "$TEST_DIR/snapshot" && printf '%s\n' "$TEST_DIR/snapshot"; }
 detect_adguard() { AGH_PRESENT=0; AGH_READY=0; [[ ! -f "$TEST_DIR/installed" ]] || AGH_PRESENT=1; }
-fetch_and_run_installer() { touch "$TEST_DIR/installed"; systemctl enable --now "$AGH_SVC"; }
+fetch_and_run_installer() {
+  [[ -f "$AGH_SETUP_DROPIN" ]] || return 1
+  touch "$TEST_DIR/installed"
+  systemctl enable "$AGH_SVC"
+}
 rm "$AGH_YAML"
 install_adguard
 ''')
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.state("pihole-FTL"), (True, False))
         self.assertEqual(self.state("AdGuardHome"), (False, False))
+        self.assertEqual(self.state("nexo-adguard-setup.service"), (False, False))
+        self.assertIn("ssh -N", result.stdout)
+        self.assertTrue((self.path / "AdGuardHome.service.d/99-nexo-setup.conf").is_file())
+
+    def test_setup_limits_first_service_command_before_running_installer(self):
+        result = self.shell(r'''
+AGH_PRESENT=0; AGH_READY=0; ENGINE=adguard
+backup_now() { mkdir "$TEST_DIR/snapshot" && printf '%s\n' "$TEST_DIR/snapshot"; }
+detect_adguard() { :; }
+rm "$AGH_YAML"
+fetch_and_run_installer() {
+  if [[ -f "$AGH_SETUP_DROPIN" ]]; then cp "$AGH_SETUP_DROPIN" "$TEST_DIR/during-install.conf"; fi
+  return 1
+}
+dns_transaction "pihole-FTL $AGH_SVC" dns_install_adguard
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        created = self.path / "during-install.conf"
+        self.assertTrue(created.is_file(), result.stdout + result.stderr)
+        self.assertIn("[Unit]\nConditionPathExists=!", created.read_text())
+        self.assertNotIn("ExecStart=", created.read_text())
+        self.assertEqual(self.state("pihole-FTL"), (True, False))
+
+    def test_setup_failed_reload_leaves_previous_filter_untouched(self):
+        result = self.shell(r'''
+AGH_PRESENT=0; AGH_READY=0; ENGINE=adguard
+backup_now() { mkdir "$TEST_DIR/snapshot" && printf '%s\n' "$TEST_DIR/snapshot"; }
+rm "$AGH_YAML"
+touch "$TEST_DIR/fail-reload"
+fetch_and_run_installer() { touch "$TEST_DIR/installer-was-called"; return 1; }
+dns_transaction "pihole-FTL $AGH_SVC" dns_install_adguard
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("No se pudo cargar la protección", result.stdout)
+        self.assertFalse((self.path / "installer-was-called").exists())
+        self.assertNotIn("stop:pihole-FTL", (self.path / "events").read_text())
+        self.assertEqual(self.state("pihole-FTL"), (True, False))
+
+    def test_setup_aborts_if_systemd_did_not_load_guard(self):
+        result = self.shell(r'''
+AGH_PRESENT=1; AGH_READY=0; ENGINE=adguard
+backup_now() { mkdir "$TEST_DIR/snapshot" && printf '%s\n' "$TEST_DIR/snapshot"; }
+rm "$AGH_YAML"
+touch "$TEST_DIR/missing-loaded-guard"
+dns_transaction "pihole-FTL $AGH_SVC" dns_install_adguard
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Systemd no cargó la protección", result.stdout)
+        self.assertNotIn("stop:pihole-FTL", (self.path / "events").read_text())
+        self.assertEqual(self.state("pihole-FTL"), (True, False))
+
+    def test_setup_requires_effective_condition_not_just_dropin(self):
+        result = self.shell(r'''
+touch "$TEST_DIR/reset-guard-condition"
+agh_prepare_setup
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Systemd no conservó la condición", result.stdout)
+
+    def test_setup_guard_is_reinstated_after_activation_fails(self):
+        result = self.shell(r'''
+backup_now() { mkdir "$TEST_DIR/snapshot" && cp -p "$AGH_YAML" "$TEST_DIR/snapshot/AdGuardHome.yaml" && printf '%s\n' "$TEST_DIR/snapshot"; }
+dns_healthy() { return 1; }
+agh_prepare_setup || exit 1
+dns_transaction "pihole-FTL $AGH_SVC" dns_install_adguard
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("start:AdGuardHome", (self.path / "events").read_text())
+        self.assertTrue((self.path / "AdGuardHome.service.d/99-nexo-setup.conf").is_file())
+        self.assertEqual(self.state("pihole-FTL"), (True, False))
+        self.assertEqual(self.state("AdGuardHome"), (False, False))
+        self.assertIn("address: 127.0.0.1:80", (self.path / "AdGuardHome.yaml").read_text())
+
+    def test_setup_socket_check_allows_other_ports_but_requires_loopback_web(self):
+        result = self.shell(r'''
+ss() {
+  printf '%s\n' \
+    'LISTEN 0 128 127.0.0.1:3000 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=3))' \
+    'LISTEN 0 128 0.0.0.0:53 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=4))'
+}
+touch "$TEST_DIR/nexo-adguard-setup.service.exists"
+agh_setup_socket_local
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_setup_socket_check_rejects_exposed_web_port(self):
+        result = self.shell(r'''
+ss() {
+  printf '%s\n' \
+    'LISTEN 0 128 0.0.0.0:3000 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=3))' \
+    'LISTEN 0 128 127.0.0.1:3000 0.0.0.0:* users:(("AdGuardHome",pid=12345,fd=4))'
+}
+touch "$TEST_DIR/nexo-adguard-setup.service.exists"
+! agh_setup_socket_local
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_rollback_of_ready_adguard_restores_previous_service_state(self):
+        result = self.shell(r'''
+backup_now() { mkdir "$TEST_DIR/snapshot" && cp -p "$AGH_YAML" "$TEST_DIR/snapshot/AdGuardHome.yaml" && printf '%s\n' "$TEST_DIR/snapshot"; }
+systemctl enable --now "$AGH_SVC" || exit 1
+# Una condición cargada después del arranque no detiene el servicio activo.
+mkdir -p "${AGH_SETUP_DROPIN%/*}" && agh_setup_unit > "$AGH_SETUP_DROPIN" || exit 1
+failing_op() {
+  dns_prepare_adguard_setup || return 1
+  dns_touch_service "$AGH_SVC" "$AGH_YAML"
+  return 1
+}
+dns_transaction "pihole-FTL $AGH_SVC" failing_op
+''')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.state("AdGuardHome"), (True, True))
+
+    def test_configured_adguard_removes_its_setup_override(self):
+        result = self.shell(r'''
+agh_prepare_setup || exit 1
+configure_adguard
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.path / "AdGuardHome.service.d/99-nexo-setup.conf").exists())
+        self.assertEqual(self.state("AdGuardHome"), (True, False))
+        self.assertIn("  address: 127.0.0.1:80", (self.path / "AdGuardHome.yaml").read_text())
 
     def test_failed_full_install_restores_prior_services_and_configuration(self):
         result = self.shell(r'''
