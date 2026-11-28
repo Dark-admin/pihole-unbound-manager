@@ -1113,11 +1113,13 @@ find_root_hints() {
   echo ""
 }
 
-# Una zona raíz sana lleva el SOA de "." y al menos un glue de los servidores
-# raíz; cualquier otra cosa (HTML de error, captura de portal) se rechaza.
-# Ojo: Internic separa los campos con tabuladores y publica la zona en
-# minúsculas (nada que ver con el named.root de root.hints).
-root_zone_valid() { grep -qE '(^|[[:space:]])IN[[:space:]]+SOA([[:space:]]|$)' "$1" && grep -qiE '[[:space:]]NS[[:space:]]+[a-m]\.root-servers\.net\.' "$1"; }
+# Comprobación mínima de estructura; Unbound valida DNSSEC al resolver.
+root_zone_valid() {
+  awk 'tolower($1)=="." && tolower($3)=="in" {
+    if (tolower($4)=="soa") soa=1
+    if (tolower($4)=="ns" && tolower($5) ~ /^[a-m]\.root-servers\.net\.$/) ns=1
+  } END {exit !(soa && ns)}' "$1"
+}
 
 # Zona raíz local (RFC 8806): Unbound sirve las delegaciones de TLD desde
 # disco en vez de preguntarlas a los servidores raíz en cada consulta fría.
@@ -1127,22 +1129,18 @@ root_zone_valid() { grep -qE '(^|[[:space:]])IN[[:space:]]+SOA([[:space:]]|$)' "
 find_root_zone() {
   local zone tmp
   zone=${ROOT_ZONE:-/var/lib/unbound/root.zone}
-  mkdir -p "$(dirname "$zone")" 2>/dev/null || true
-  tmp="$zone.new"
-  if curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
-     -o "$tmp" https://www.internic.net/domain/root.zone 2>/dev/null \
-     && root_zone_valid "$tmp"; then
-    mv "$tmp" "$zone"
-    chown unbound:unbound "$zone" 2>/dev/null || true
-    echo "$zone"
-    return
+  if mkdir -p -- "$(dirname "$zone")" 2>/dev/null && tmp=$(mktemp "$zone.XXXXXX"); then
+    if curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+       -o "$tmp" https://www.internic.net/domain/root.zone 2>/dev/null \
+       && root_zone_valid "$tmp" && chmod 644 "$tmp" && mv -fT -- "$tmp" "$zone"; then
+      printf '%s\n' "$zone"
+      return
+    fi
+    rm -f -- "$tmp"
   fi
-  rm -f "$tmp"
   if [[ -s "$zone" ]] && root_zone_valid "$zone"; then
-    echo "$zone"
-    return
+    printf '%s\n' "$zone"
   fi
-  echo ""
 }
 
 write_unbound_conf() {
@@ -1167,7 +1165,11 @@ write_unbound_conf() {
 auth-zone:
     name: \".\"
     zonefile: \"$zone\"
-    for-upstream: yes"
+    master: 192.0.47.132
+    master: 192.0.32.132
+    for-downstream: no
+    for-upstream: yes
+    fallback-enabled: yes"
   else
     zone_line='# sin zona raíz local: las delegaciones de TLD se preguntan a los
 # servidores raíz (recursión normal, un poco más lenta en frío)'
@@ -1266,8 +1268,8 @@ server:
     infra-cache-numhosts: 10000
 
     ### TTLs ##################################################################
-    # 300 s (5 min) de suelo: los CDN usan TTLs de 30-60 s para balancear y
-    # hacer failover; con 5 min la caché sigue obedeciendo a cualquier CDN real.
+    # El suelo de 300 s favorece la caché, pero puede retrasar cambios de IP
+    # en sitios con TTL bajo. Usa --min-ttl 0 si prefieres respetar ese TTL.
     cache-min-ttl: $min_ttl
     cache-max-ttl: 86400
     serve-expired: yes

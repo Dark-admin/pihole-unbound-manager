@@ -119,6 +119,7 @@ bench_dns --json --names "$TEST_NAMES"
 UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
 detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
 find_root_hints() { :; }
+find_root_zone() { :; }
 prune_unsupported() { :; }
 parse_optimize_args --referral standard --min-ttl 0 && write_unbound_conf
 ''', TEST_UNBOUND=str(conf))
@@ -136,6 +137,7 @@ parse_optimize_args --referral standard --min-ttl 0 && write_unbound_conf
 UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
 detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
 find_root_hints() { :; }
+find_root_zone() { :; }
 prune_unsupported() { :; }
 parse_optimize_args && write_unbound_conf
 ''', TEST_UNBOUND=str(conf))
@@ -151,6 +153,7 @@ parse_optimize_args && write_unbound_conf
 UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
 detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
 find_root_hints() { :; }
+find_root_zone() { :; }
 prune_unsupported() { :; }
 printf 'server:\n  cache-min-ttl: %s\n' "$TEST_OLD_TTL" > "$UNBOUND_CONF"
 parse_optimize_args && write_unbound_conf
@@ -181,6 +184,8 @@ parse_optimize_args && write_unbound_conf
         self.assertIn('name: "."', content)
         self.assertIn('zonefile: "%s"' % zone, content)
         self.assertIn('for-upstream: yes', content)
+        self.assertIn('for-downstream: no', content)
+        self.assertIn('fallback-enabled: yes', content)
 
     def test_unbound_without_root_zone_recurses_normally(self):
         with tempfile.TemporaryDirectory() as folder:

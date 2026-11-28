@@ -358,9 +358,9 @@ ajuste está ahí por una razón concreta:
 
 | Ajuste | Motivo |
 |---|---|
-| `cache-min-ttl: 300` | Los CDN usan TTLs de 30-60 s para balancear y hacer failover; con 5 min de suelo la caché aguanta las ráfagas sin dejarte clavado en una IP muerta cuando el CDN mueve el tráfico. Un `--min-ttl` explícito siempre manda. |
-| `serve-expired-ttl: 3600` + `client-timeout: 300` | Sirve caducado si no consigue respuesta fresca en 300 ms (antes 1,8 s), y como mucho una hora. Sin acotar, un registro obsoleto se sirve indefinidamente. |
-| Zona raíz local (RFC 8806) | Unbound sirve las delegaciones de TLD desde `/var/lib/unbound/root.zone` en vez de preguntarlas a los servidores raíz: un TLD inexistente pasa de ~90 ms a ~2 ms (medido en la Pi). Se descarga de Internic en cada optimización con validación y reemplazo atómico; si no hay zona válida, se recurre a la recursión normal y todo sigue funcionando. |
+| `cache-min-ttl: 300` | Mantiene respuestas breves más tiempo en caché, a cambio de tardar más en ver cambios de IP en sitios que publican TTL bajos. Usa `--min-ttl 0` para respetar el TTL corto; si la configuración guardada tiene `120`, se trata como el valor anterior por defecto. |
+| `serve-expired-ttl: 3600` + `serve-expired-client-timeout: 300` | Si hay un registro caducado utilizable, Unbound espera hasta 300 ms por el refresco (antes 1,8 s) antes de devolverlo. No es un límite para consultas sin caché. |
+| Zona raíz local (RFC 8806) | Unbound consulta la copia local durante la recursión, no entrega delegaciones a los clientes. Nexo DNS carga una copia inicial de InterNIC y Unbound la mantiene actualizada desde los servidores de transferencia de ICANN. Si la zona falla o caduca, vuelve a consultar la raíz pública, sin reenviadores DNS. |
 | `use-caps-for-id: no` | El 0x20 encoding es anti-spoofing, pero bastantes autoritativos y CDNs no preservan mayúsculas y devuelven SERVFAIL intermitentes. Con DNSSEC validando no compensa. |
 | `module-config: "validator iterator"` | Sin `subnetcache`. ECS filtra tu subred a los servidores autoritativos —justo lo contrario de para qué montas un recursivo— y además desactiva `prefetch` y `serve-expired` para ese tráfico. |
 | `private-address` (RFC1918) | Anti DNS-rebinding: un dominio público jamás debe resolver a una IP de tu red interna. |
@@ -372,11 +372,8 @@ ajuste está ahí por una razón concreta:
 En el lado de Pi-hole: `dnssec = false` (ya valida Unbound, hacerlo dos veces
 gasta CPU), `domainNeeded` y `bogusPriv` activos, y `EDNS0ECS` desactivado.
 
-Sobre las consultas ANY: medido en la Pi, un `ANY` a Unbound devuelve
-`ANSWER: 3` gracias a `minimal-responses`, y además Unbound solo escucha en
-localhost (quien pregunta es el propio Pi-hole), así que no hay amplificación
-que recortar y no hace falta `deny-any`. Si algún día expusieras Unbound a la
-red, esa decisión habría que reevaluarla.
+Unbound sigue escuchando solo en localhost y conserva `minimal-responses`.
+Esta mejora no cambia el tratamiento de consultas ANY en Unbound ni en el filtro.
 
 ## Precalentado de caché
 
