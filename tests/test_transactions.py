@@ -99,6 +99,7 @@ systemctl() {
     restart) systemctl stop "$service" && systemctl start "$service" ;;
     start)
       [[ -f "$p.exists" ]] || return 1
+      if [[ "$service" == AdGuardHome && -f "$AGH_SETUP_DROPIN" ]]; then return 0; fi
       if [[ "$service" == AdGuardHome ]] && grep -q '^  port: 5354$' "$AGH_YAML"; then return 1; fi
       printf 'start:%s\n' "$service" >> "$TEST_DIR/events"
       touch "$p.active" ;;
@@ -274,8 +275,9 @@ touch "$TEST_DIR/nexo-adguard-setup.service.exists"
     def test_rollback_of_ready_adguard_restores_previous_service_state(self):
         result = self.shell(r'''
 backup_now() { mkdir "$TEST_DIR/snapshot" && cp -p "$AGH_YAML" "$TEST_DIR/snapshot/AdGuardHome.yaml" && printf '%s\n' "$TEST_DIR/snapshot"; }
-agh_prepare_setup || exit 1
-systemctl enable --now "$AGH_SVC"
+systemctl enable --now "$AGH_SVC" || exit 1
+# Una condición cargada después del arranque no detiene el servicio activo.
+mkdir -p "${AGH_SETUP_DROPIN%/*}" && agh_setup_unit > "$AGH_SETUP_DROPIN" || exit 1
 failing_op() {
   dns_prepare_adguard_setup || return 1
   dns_touch_service "$AGH_SVC" "$AGH_YAML"

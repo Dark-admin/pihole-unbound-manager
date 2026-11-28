@@ -1670,7 +1670,12 @@ dns_rollback() {
     err "El filtro se queda detenido hasta recuperar las reglas de protección"
   fi
   if (( txn_agh_setup )); then
-    agh_prepare_setup || failed=1
+    if (( ! txn_agh_fresh && txn_active[$AGH_SVC] )); then
+      # Un drop-in residual impediría reactivar un AdGuard ya configurado.
+      agh_remove_setup || failed=1
+    else
+      agh_prepare_setup || failed=1
+    fi
   fi
   for svc in unbound pihole-FTL "$AGH_SVC"; do
     [[ -v txn_services[$svc] ]] || continue
