@@ -129,6 +129,138 @@ parse_optimize_args --referral standard --min-ttl 0 && write_unbound_conf
         self.assertIn('harden-dnssec-stripped: yes', content)
         self.assertIn('module-config: "validator iterator"', content)
 
+    def test_unbound_defaults_raise_min_ttl_and_cut_expired_wait(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+prune_unsupported() { :; }
+parse_optimize_args && write_unbound_conf
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = conf.read_text(encoding='utf-8')
+        self.assertIn('cache-min-ttl: 300', content)
+        self.assertIn('serve-expired-client-timeout: 300', content)
+
+    def test_unbound_min_ttl_preserves_persisted_user_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            code = r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+prune_unsupported() { :; }
+printf 'server:\n  cache-min-ttl: %s\n' "$TEST_OLD_TTL" > "$UNBOUND_CONF"
+parse_optimize_args && write_unbound_conf
+'''
+            result = self.shell(code, TEST_UNBOUND=str(conf), TEST_OLD_TTL='120')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('cache-min-ttl: 120', conf.read_text(encoding='utf-8'))
+            result = self.shell(code, TEST_UNBOUND=str(conf), TEST_OLD_TTL='60')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('cache-min-ttl: 60', conf.read_text(encoding='utf-8'))
+
+    def test_unbound_bootstraps_root_zone_without_installer_download(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            zone = Path(folder, 'root.zone')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND; MODEL=fixture; OS_NAME=fixture
+detect_hw() { RAM_MB=900 CORES=4 THREADS=2 MSG=32m RRSET=64m KEYC=8m NEG=2m SLABS=2; }
+find_root_hints() { :; }
+curl() { printf 'unexpected root-zone download\n' >&2; return 1; }
+prune_unsupported() { :; }
+parse_optimize_args && write_unbound_conf
+''', TEST_UNBOUND=str(conf), ROOT_ZONE=str(zone))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn('unexpected root-zone download', result.stderr)
+            self.assertFalse(zone.exists())
+            content = conf.read_text(encoding='utf-8')
+        self.assertIn('auth-zone:', content)
+        self.assertIn('name: "."', content)
+        self.assertIn('master: 192.0.47.132', content)
+        self.assertIn('master: 192.0.32.132', content)
+        self.assertIn('for-upstream: yes', content)
+        self.assertIn('for-downstream: no', content)
+        self.assertIn('fallback-enabled: yes', content)
+        self.assertNotIn('zonefile:', content)
+
+    def test_adguard_keeps_legacy_cache_ttl_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            code = r'''
+UNBOUND_CONF=$TEST_UNBOUND; IS_VPS=0
+detect_adguard() { AGH_PRESENT=1; AGH_READY=1; }
+detect_hw() { RAM_MB=900; }
+agh_no_client_upstreams() { :; }
+systemctl() { :; }
+agh_set_list() { :; }
+agh_put() { :; }
+agh_validate_config() { :; }
+sleep() { :; }
+agh_set() { if [[ $2 == cache_ttl_min ]]; then printf 'ttl=%s\n' "$3"; fi; }
+printf 'server:\n  cache-min-ttl: %s\n' "$TEST_OLD_TTL" > "$UNBOUND_CONF"
+configure_adguard
+'''
+            for current, expected in ((300, 120), (120, 120), (60, 60), (0, 0)):
+                with self.subTest(current=current):
+                    result = self.shell(code, TEST_UNBOUND=str(conf), TEST_OLD_TTL=str(current))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('ttl=%s' % expected, result.stdout.splitlines())
+
+    def test_prune_removes_whole_unknown_clause_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            conf.write_text(
+                'server:\n    port: 5335\n\n'
+                'auth-zone:\n    name: "."\n    zonefile: "/tmp/root.zone"\n'
+                '    for-upstream: yes\n\n'
+                'remote-control:\n    control-enable: yes\n',
+                encoding='ascii')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND
+unbound-checkconf() {
+  if grep -q 'auth-zone' "$UNBOUND_CONF"; then
+    echo "unbound-checkconf: error: unknown keyword 'auth-zone'" >&2
+    return 1
+  fi
+  ! grep -q 'zonefile\|for-upstream' "$UNBOUND_CONF"
+}
+prune_unsupported
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            content = conf.read_text(encoding='ascii')
+        self.assertNotIn('auth-zone', content)
+        self.assertNotIn('zonefile', content)
+        self.assertNotIn('for-upstream', content)
+        self.assertIn('remote-control:', content)
+        self.assertIn('control-enable: yes', content)
+        self.assertIn('port: 5335', content)
+
+    def test_prune_never_leaves_root_zone_without_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            conf = Path(folder, 'unbound.conf')
+            conf.write_text(
+                'server:\n    port: 5335\nauth-zone:\n    name: "."\n'
+                '    for-upstream: yes\n    fallback-enabled: yes\n'
+                'remote-control:\n    control-enable: yes\n', encoding='ascii')
+            result = self.shell(r'''
+UNBOUND_CONF=$TEST_UNBOUND
+unbound-checkconf() {
+  if grep -q 'fallback-enabled:' "$UNBOUND_CONF"; then
+    echo "unknown keyword 'fallback-enabled'" >&2
+    return 1
+  fi
+}
+prune_unsupported
+''', TEST_UNBOUND=str(conf))
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            content = conf.read_text(encoding='ascii')
+        self.assertNotIn('auth-zone:', content)
+        self.assertIn('remote-control:', content)
+
     def test_unbound_reload_retains_cache_only_with_compatible_config(self):
         with tempfile.TemporaryDirectory() as folder:
             old = Path(folder, 'old.conf')

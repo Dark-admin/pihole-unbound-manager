@@ -358,8 +358,9 @@ ajuste está ahí por una razón concreta:
 
 | Ajuste | Motivo |
 |---|---|
-| `cache-min-ttl: 120` | Los CDN usan TTLs de 30-60 s para balancear y hacer failover. Forzarlos a una hora te deja clavado en una IP muerta cuando el CDN mueve el tráfico. |
-| `serve-expired-ttl: 3600` + `client-timeout: 1800` | Sirve caducado solo si no consigue respuesta fresca en 1,8 s, y como mucho una hora. Sin acotar, un registro obsoleto se sirve indefinidamente. |
+| `cache-min-ttl: 300` | Valor de Unbound cuando no hay uno guardado. Mantiene respuestas breves en caché durante más tiempo, a cambio de tardar más en ver cambios de IP. Se conserva el valor anterior, incluido `120`. Para cambiarlo, usa `optimize --min-ttl 300`; elige `0` para respetar TTL bajos. AdGuard conserva su límite anterior de 120 s. |
+| `serve-expired-ttl: 3600` + `serve-expired-client-timeout: 300` | Si hay un registro caducado utilizable, Unbound espera hasta 300 ms por el refresco (antes 1,8 s) antes de devolverlo. No es un límite para consultas sin caché. |
+| Zona raíz local (RFC 8806) | Unbound obtiene y refresca la zona por AXFR y la mantiene en memoria, sin que el instalador descargue ni sobrescriba archivos. Mientras no esté disponible, o si caduca, vuelve a consultar la raíz pública. No entrega delegaciones directamente a los clientes ni usa reenviadores DNS. |
 | `use-caps-for-id: no` | El 0x20 encoding es anti-spoofing, pero bastantes autoritativos y CDNs no preservan mayúsculas y devuelven SERVFAIL intermitentes. Con DNSSEC validando no compensa. |
 | `module-config: "validator iterator"` | Sin `subnetcache`. ECS filtra tu subred a los servidores autoritativos —justo lo contrario de para qué montas un recursivo— y además desactiva `prefetch` y `serve-expired` para ese tráfico. |
 | `private-address` (RFC1918) | Anti DNS-rebinding: un dominio público jamás debe resolver a una IP de tu red interna. |
@@ -370,6 +371,9 @@ ajuste está ahí por una razón concreta:
 
 En el lado de Pi-hole: `dnssec = false` (ya valida Unbound, hacerlo dos veces
 gasta CPU), `domainNeeded` y `bogusPriv` activos, y `EDNS0ECS` desactivado.
+
+Unbound sigue escuchando solo en localhost y conserva `minimal-responses`.
+Esta mejora no cambia el tratamiento de consultas ANY en Unbound ni en el filtro.
 
 ## Precalentado de caché
 
